@@ -1,0 +1,1313 @@
+---
+title: 'A script for extracting summary and descriptive statistics from FoodMicrobionet METAOlive subset (v5.0.1)'
+subtitle: "Fungi"
+author: "Prof. E. Parente, DAFE, Università degli Studi della Basilicata"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    df_print: paged
+---
+
+**NOTES FOR SELF**
+
+* What do we do for olives to which spices/herbs are added? Technically one may add a comma delimited vector of spices but data wrangling may become complicated; however, this information might be important; plus, what do we use to identify spices? Common names? Latin names? Something with a stronger link with FoodOn or FoodEx?  
+
+* I have left for later the (optional) rarefaction and rarefaction analysis using Vegan functions, although there is a phyloseq function as well: rarefy_even_depth()  
+
+* in next iteration remove the ad hoc statements (I will fix everything inside FMBN)
+
+* this version uses FMBN v 5.0.1: some problems with sample metadata which required ad hoc fixes here were fixed in the sample table of FMBN and the ad hoc code will not be needed
+
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = FALSE)
+
+# loading packages
+.cran_packages <- c("tidyverse", "randomcoloR", "knitr", "rnaturalearth", "ggrepel",
+                    "rnaturalearthdata", "readxl", "beepr", "vegan", "crayon",
+                    "kableExtra")
+.bioc_packages <- c("BiocManager", "phyloseq")
+
+# package PERFect is not needed with filter_my_taxa v 1.2 onward
+
+.inst <- .bioc_packages %in% installed.packages()
+if(any(!.inst)) {
+  if(!.inst[1]) {
+    install.packages("BiocManager")
+    .inst <- .bioc_packages %in% installed.packages()
+  }
+  if(any(!.inst[2:length(.inst)])) {
+    BiocManager::install(.bioc_packages[!.inst], ask = F)
+  }
+}
+
+.inst <- .cran_packages %in% installed.packages()
+if(any(!.inst)) {
+  install.packages(.cran_packages[!.inst])
+}
+sapply(c(.cran_packages,.bioc_packages ), require, 
+       character.only = TRUE)
+
+opar <- par(no.readonly=TRUE) 
+par(ask=F) 
+set.seed(1234) 
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+```
+
+```{r options_functions, echo = F, warning = F, include=F}
+
+## load functions
+fn_path <- "source"
+# load the filter_my_taxa function
+source(file.path(fn_path,"filter_my_taxa_function_1_2.R"))
+# open and read the function for more details
+
+# load the make_OTU_palette function
+source(file.path(fn_path,"make_OTU_palettes.R"))
+
+# load the prevab_pc function (needed for ordering prevalence and abundance tables)
+source(file.path(fn_path,"pc_prevab.R"))
+
+# extra options
+verbose_output <- T # this prints extra output (tables mostly). 
+# Set to F if you don't want it.
+
+play_sound <- T # plays a sound with beepr::beep() when execution is completed
+which_sound <- 6 # the sound you are going to hear
+
+outfn_prefix <- "FMBN_METAO_F_0225" # a prefix used for saved output files
+out_folder <- "output_fungi" # the output folder
+if(!dir.exists(out_folder)) dir.create(out_folder)
+
+# options for saving graphs
+savegraph <- F  # set savegraph to T if you want to save graphs 
+# (some graphs won't be displayed, only saved); use F if you don't want to save
+graphresolution <- 300 # in dpi
+graphsizein <- 7 # size in inches, overridden in some graphs
+graphtype <- "tif" # alternative value is "pdf", avoid using "jpg"
+gfileext <- ifelse (graphtype == "pdf", ".pdf", ".tiff") 
+
+#digits in tables
+dgts <- 3
+
+# options for number of OTU groups in sample and OTU palettes
+overrides <- F # set to T if you want more than 15 categories in sample palettes
+overrideOTU <- F # set to T if you want more than 15 categories in OTU palettes
+
+# The "Other" column has no taxonomic meaning unless it is an aggregate of
+# several OTUs (see instructions in the FMBN_make_files* script) and will be
+# removed by default. The "Chloroplast" and "Mitochondria" columns only indicate  
+# contamination with chloroplast or mitochondria  DNA/RNA and should also be  
+# removed. Set to F if you want to keep these columns in OTU tables.
+# Eukaryota can also be removed
+removeOther <- T
+removeKonly <- T # removes the taxa which have been identified only at the level of Kingdom
+removeChloroplast <- T # only needed if you work on 16S as a target
+removeMitochondria <- T # only needed if you work on 16S as a target
+removeFungi <- F # F if you are working on fungi, T if you are working on bacteria
+
+glom_level <- "genus"
+# may be used in tax_glom; will remove anything which has an identification above
+# this level and agglomerate the taxa at the tax_glom level; use wisely
+# "none" no agglomeration, "genus", "family", "order", "class"
+# will return an error if not in rank_names()
+
+# options for filtering samples and OTUs/features
+
+# if filtersamples == T the sample filter will be applied (overridden if sample_agg == "exp. code")
+# if filterOTUs == T a prevab or permutation filter will be applied to OTUs/features
+filtersamples <- T
+# samples/sample groups with less than minsampleab sequences will be removed
+minsampleab <- 1000 
+
+filterOTUs <- T
+prev_filter <- "prevab" # the type of filter, prevab or PERFect
+# filter for OTU abundance. OTUs with a maximum relative abundance < abthreshold
+# will be removed or pooled (see below)
+# keep the value low or you will loose too many OTUs between filtering and
+# rarefaction
+ab_threshold <- 0.005
+# options for taxa prevalence filter 
+prev_threshold <- 0.01 # as fraction of samples
+prev_filter_flag <- F
+pass_both <- T # both the prevalence and abundance filter must be passed
+
+# sorting the prevalence and abundance table, this is only important for selecting top OTUs
+prevab_sort_option <- "comp1" 
+# alternatives are
+# decr_prev: by decreasing prevalence, the default; 
+# decr_ab: by decreasing average relative abundance, regardless of the prevalence
+# prevab: decreasing prevab, 100*relAbundance*relprev); not very advisable
+# comp1: uses the results of the prevab_pc function; a reasonable compromise
+
+# flags for filtering, will be set to true if filtering is performed
+filtersamples_flag <- F
+filterOTU_flag <- F
+
+# NOTE FOR SELF: need to fix this is I decide to rarefy
+# rarefy? if rareoption<-T vegan::rrarefy() will be used to extract a random rarefied
+# matrix. If raremin is T will rarefy to the closest hundred below the
+# minimum number of sequences, otherwise will rarefy to raren.
+# The default is F, although rarefaction will be performed for bipartite
+# analysis 
+
+rareoption <- T
+raremin <- T
+raren <- 10000
+rarefy_flag <- F # will be set to T if rarefaction is performed
+
+# pooling of filtered OTUs: if pool is T, abundances of OTUs removed by 
+# filtering are pooled and shown as "Other" in bar charts; does not apply
+# to heat maps and MDS.
+pool <- T 
+
+# maximum number of OTUs allowed in stacked bar charts
+# will be used to generate the OTU palette with randomcoloR
+maxOTUcats <- 25
+# maximum number of "species" for which prevalence and abundance is saved
+topp <- 50
+# if the number of "species" in data is lower, then it is going to be the 
+# max number of species
+# maximum number of "species" in box plots, heat maps and NMDS
+# must be <topp
+topn <-25
+# max "samples" or sample categories for barplots and boxplots
+max_samples <- 25
+# max number of samples in the bonus barplot (the last chunk!)
+topx <- 19
+
+# logging the color scale in heat maps; set to T if you want the scale
+# in log10(relabundance); set to F if you want to keep a linear scale
+loghmscale <- T
+# option for performing rarefaction analysis on the unfiltered matrix
+dorareanalysis <- F
+
+
+
+```
+
+
+```{r loading_data, echo = F, message = F, warning=F}
+
+metaolive_phy_F <- readRDS(file.path("data", "olive_FMBN_5_F_phy.rds"))
+# extract components 
+sample_data_F <- as(sample_data(metaolive_phy_F), "data.frame")
+taxa_F <- as(tax_table(metaolive_phy_F), "matrix")
+taxa_F <- as(tax_table(metaolive_phy_F), "matrix")
+OTU_F <- as(otu_table(metaolive_phy_F), "matrix")
+
+# get studies
+studies <- read_xlsx(file.path("data", "FMBN_5_olive_studies.xlsx"))
+# filter and retain only the ones with bacteria
+studies_F_vector <- pull(sample_data_F, studyId) |> unique()
+
+studies_F <- studies |>
+  dplyr::filter(studyId %in% studies_F_vector)
+# replace accented letters
+studies_F <- studies_F |>
+  mutate(ref_short = str_replace_all(ref_short, pattern = "√≥", replacement = "ó")) |>
+  mutate(ref_short = str_replace_all(ref_short, pattern = "√≠", replacement = "í"))
+
+# get extra metadata 
+extra_metadata_F <- read_xlsx(file.path("data", "extra_metadata_FMBN_F.xlsx"), sheet = "Metadata")
+
+# join the metadata, plus add a few other grouping or labeling variables
+# a fix for study ST248 
+# replace some data for ST248
+sample_data_F <- sample_data_F |> 
+  rownames_to_column("SRA_run") 
+
+ST248_meta <- read_xlsx(file.path("data","ST248_F_metadata.xlsx"))
+
+variable_order <- colnames(sample_data_F)
+sample_data_F_1 <- sample_data_F |>
+  dplyr::filter(studyId != "ST248")
+sample_data_F_2 <- sample_data_F |>
+  dplyr::filter(studyId == "ST248")
+
+sample_data_F_2 <- sample_data_F_2 |> 
+  select(SRA_run:foodId, L1:SRA_sample, lat_lon:L3) |>
+  left_join(select(ST248_meta, sampleId, description, geo_loc_country, geo_loc_continent)) |>
+  select(variable_order)
+
+sample_data_F <- bind_rows(sample_data_F_1, sample_data_F_2)
+
+
+sample_data_F_extra <- sample_data_F |> 
+  rename(spoil_ferm = spoilage) 
+# if necessary |> rownames_to_column("SRA_run")
+  
+# add further variables from metadata
+sample_data_F_extra <- left_join(sample_data_F_extra,
+                                 select(extra_metadata_F, sampleId, descr = description, DOI,
+                                        olive_cultivar:Duration_of_storage_post_fermentation_d)
+                                 )
+# a few mutate ops
+sample_data_F_extra <- sample_data_F_extra |>
+  mutate(olive_cv_short = str_sub(olive_cultivar, start = 1, end = 3),
+         olive_var_short = str_sub(olive_variety, start = 1, end = 3),
+         sample_type_short = case_when(
+           sample_type == "fruit" ~ "F",
+           sample_type == "brine" ~ "B",
+           sample_type == "fruit+brine" ~ "BF",
+           .default = "O"
+         )
+  ) |>
+  mutate(group_short = str_c(olive_var_short, sample_type_short, sep ="_")) |>
+  mutate(nature = if_else(is.na(nature), "Other", nature),
+         process = if_else(is.na(process), "Other", process),
+         spoilage = if_else(is.na(spoilage), "Other", spoilage)) |>
+  mutate(ripe_trade = str_c(str_remove(sample_data_F_extra$olive_ripeness, " olives"),
+                            str_remove(sample_data_F_extra$olive_trade_prep, " olives"), sep = " ")) |>
+  column_to_rownames(var = "SRA_run")
+
+# write_tsv(sample_data_F_extra, file = file.path("data", "sample_F_extra_0125.tsv"))
+# put the metadata back into the phyloseq
+sample_data(metaolive_phy_F) <- sample_data_F_extra
+
+# any further operation will be performed on a copy
+myphyseq <- metaolive_phy_F
+saveRDS(myphyseq, file.path("data", "olive_FMBN_5_0_1_F_extra_phy.rds"))
+
+# quick check
+# View(as(sample_data(metaolive_phy_F), "data.frame"))
+```
+
+# FMBN-METAOlive statistics.  
+
+This report is designed to provide summary statistics for the subset of data on table olives extracted from FoodMicrobionet, version 5.0 or higher. It takes as an input a merged phyloseq object with extra metadata and returns summary data and statistics and a few descriptive graphs. You can perosnalize most of your analysis in the **options_functions** chunk.    
+
+
+# Statistics on studies.
+
+```{r get_descr_stats, echo = F, message = F}
+n_studies <- nrow(studies)
+n_studies_16S_only <- nrow(dplyr::filter(studies_F, !str_detect(target, "ITS")))
+n_studies_ITS_only <- nrow(dplyr::filter(studies, str_detect(target, "ITS") & !str_detect(target, "16S")))  
+n_studies_both <- nrow(dplyr::filter(studies, str_detect(target, "ITS") & str_detect(target, "16S")))
+min_samples_study <- min(studies$samples)
+max_samples_study <- max(studies$samples)
+median_samples_study <- median(studies$samples)
+```
+
+
+The number of studies in this version of METAOlive FMBN is `r n_studies`. This version includes studies  on fungal microbiota only (`r n_studies_ITS_only`) and studies for which both data for bacterial and fungal microbiota are available (`r n_studies_both`). However, due to inconsistencies in the deposit of sequences in SRA (in several cases the same sample was deposited with two separate biosample accessions and/or data for bacteria and fungi were deposited with different bioproject of study accessions), the same samples might be present in two studies, one for bacteria and one for fungi^[by convention in FoodMicrobionet a study must have a unique bioproject accession and a sample a unique biosample accession]. We did our best to match samples in these situations. The addition of datasets on fungi is in progress and, when available, we will progressively add fungal data for all the studies which are already in FoodMicrobionet with bacterial community data and add more fungal studies.  
+There are **`r nrow(sample_data_F)`** samples on fungal communities of table olives in this version.  
+The experimental approaches vary and both longitudinal and cross-sectional studies are available. The number of samples per study ranges from `r min(studies_F$samples)` to `r max(studies_F$samples)`, with a medin of `r median(studies_F$samples)` samples per study.  
+
+# FMBN-METAOlive statistics for studies on fungi 
+
+## Platforms, gene target, regions.  
+
+FMBN grows by addition of sequences deposited in NCBI SRA for published studies. As a consequence, use of targets (16S RNA, 16S RNA gene, ITS) reflect what is published and the correlation between platforms and targets.  
+
+```{r platform, dpi = 96, echo = F}
+
+platform_region <- dplyr::select(studies_F, studyId, ref_short, platform, target, region, samples, year)
+
+platform_region <- platform_region %>%
+  mutate(
+    platform_2 = case_when(
+      str_detect(platform, "454 GS") ~ "454 GS",
+      str_detect(platform, "Illumina") ~ "Illumina",
+      str_detect(platform, "Ion Torrent") ~ "Ion Torrent"
+    )
+  ) %>%
+  mutate(year = as.numeric(year)) %>%
+  arrange(year)
+kable(select(platform_region, -platform), caption = "Table 1. Platforms and targets. Studies including data on fungi in table olives") |>
+  kableExtra::kable_classic()
+
+```
+
+All recent studies use Illumina as a platform and V3-V4 region of the 16S RNA gene as a target. Data on fungi will be shown in a separate report.  
+
+
+# Statistics on samples.  
+
+The number of samples per study ranges from `r min(studies_F$samples)` to `r max(studies_F$samples)`, with a median of `r median(studies_F$samples)` samples per study. 
+The geographic distribution of samples is shown below.
+
+```{r samples_by_location, echo = F, message = F, warning=F}
+# creating a table for continents
+table_by_continent <- sample_data_F_extra %>%
+  group_by(geo_loc_continent) %>%
+  count(geo_loc_continent) %>%
+  ungroup() %>%
+  arrange(desc(n)) %>%
+  mutate(prop=n/sum(n)) %>%
+  mutate(cumprop = cumsum(prop))
+kable(table_by_continent, digits = c(0,4,4,4)) |> kable_classic()
+# creating a table for countries
+table_by_country <- sample_data_F_extra %>%
+  group_by(geo_loc_country) %>%
+  count(geo_loc_country) %>%
+  ungroup() %>%
+  arrange(desc(n)) %>%
+  mutate(prop=n/sum(n)) %>%
+  mutate(cumprop = cumsum(prop),
+         geo_loc_country = if_else(geo_loc_country == "USA", "United States of America", geo_loc_country))
+kable(table_by_country, digits = c(0,rep(dgts,3)))
+
+my_countries <- sample_data_F_extra$geo_loc_country |> unique()
+
+world_2 <- left_join(world, 
+                     dplyr::select(table_by_country, sovereignt=geo_loc_country, n_samples = n)) %>%
+  mutate(logn_samples = log10(n_samples)) %>%
+  dplyr::filter(sovereignt %in% my_countries & str_detect(type, "Country|country"))
+
+# ggplot(data = world_2) +
+#  geom_sf(aes(fill = logn_samples)) +
+# scale_fill_viridis_c(direction = -1, na.value = "white") +
+#  labs(fill = "log10(samples)",
+#       title = "Number of samples, by country") +
+#  theme_bw() +
+#  theme(plot.title = element_text(hjust = 0.5))
+```
+```{r plot_map, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, results='hide',fig.keep='all'}
+ggplot(world_2) +
+  geom_sf(aes(fill = n_samples), size = I(0.2)) +
+ scale_fill_viridis_c(direction = -1, na.value = "white", trans = "log2") +
+  labs(fill = "samples (log2 scale)",
+       title = "Number of samples, by country, data on fungal communities") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+if(savegraph)  ggsave(filename = file.path(out_folder,"nsamples_by_country.jpg"), dpi = 300)
+
+```
+
+Samples were available for fruits, brine,  or contact surface and raw materials.
+ 
+```{r by_sample_type, echo = F}
+sample_data_F_extra |> 
+  mutate(as.factor(sample_type)) |>
+  count(olive_trade_prep, sample_type)
+```
+
+
+
+## Statistics by olive variety.  
+
+The data were extensively annotated using information from NCBI sample metadata files and information from the publications. Metadata included olive tree cultivar, olive ripeness, olive process, style, occurrence of spoilage, use of starters, duration of fermentation and of storage post fermentation (if known). A summary table is available below.     
+
+```{r summary_cultivar}
+sample_summary_pre_filter <- sample_data_F_extra |> 
+  count(olive_trade_prep, olive_cultivar, olive_variety, olive_var_short, olive_ripeness, sample_type)
+kable(sample_summary_pre_filter, caption = "Sample summary, before sample filtering") |> kable_classic()
+out_fn <- file.path(out_folder, str_c(outfn_prefix,"samples_prefilter.txt"))
+write_tsv(sample_summary_pre_filter, file = out_fn)
+```
+
+
+# The fungal microbiota of table olives.  
+
+I will now use a short pipeline for data analysis with the following steps:  
+
+1. filtering samples: samples with less than `r minsampleab`
+
+3. perform diversity estimation (I have left an option for rarefaction)
+
+2. filtering and agglomeration of OTU/features will perform the following operations:
+
+  + perform agglomeration with phyloseq::tax_glom() if applicable  
+  
+  + remove poorly identified taxa (skipped if tax_glom is performed)  
+  
+
+## Sample filtering.  
+  
+```{r sample_filt, echo = F}
+# add any additional filter you want here
+n_samples_prefilter <- nsamples(myphyseq)
+if(filtersamples){
+  myphyseq <- prune_samples(sample_sums(myphyseq)>=minsampleab, myphyseq)
+  filtersamples_flag <- T
+}
+
+sample_summary_post_filter <- sample_data_F_extra |> 
+  dplyr::filter(n_reads2>=minsampleab) |>
+  count(olive_trade_prep, olive_cultivar, olive_variety, olive_var_short, olive_ripeness, sample_type)
+kable(sample_summary_pre_filter, caption = "Sample summary, after sample filtering") |> kable_classic()
+out_fn <- file.path(out_folder, str_c(outfn_prefix,"samples_postfilter.txt"))
+write_tsv(sample_summary_pre_filter, file = out_fn)
+
+n_samples_postfilter <- nsamples(myphyseq)
+```
+There were `r n_samples_prefilter` in the original phyloseq object. After removing samples with less than `r minsampleab` reads, there are `r n_samples_postfilter` samples left.  
+
+
+
+## Alpha diversity.  
+
+Here I will compare the alpha diversity (in a few reasonable comparisons) before any taxa filtering or agglomeration.
+
+```{r alpha_diversity, echo = F, dpi = 96}
+
+myphyseq %>% plot_richness(x = "olive_var_short", shape = "sample_type",
+              color = "nature",
+              measures = c("Shannon", "Chao1")) +
+  scale_shape_manual(values=c(16,17,15,18)) +
+  theme_bw()
+
+alpha_div <- estimate_richness(myphyseq, measures = c("Shannon", "Chao1"))
+
+# to do: join metadata and plot using ggplot2
+# may be use facets, fills for starter, alpha for duration, need to include olive_trade prep
+# may be add jitter; consider using free for facets
+sample_data_F_2 <- sample_data_F_extra |> 
+  rownames_to_column("Run")
+
+
+alpha_div_wmetadata <- alpha_div |>
+  rownames_to_column("Run") |>
+  left_join(sample_data_F_2)
+min_Chao1 = min(alpha_div_wmetadata$Chao1)
+max_Chao1 = max(alpha_div_wmetadata$Chao1)
+  
+alpha_div_wmetadata |>
+  ggplot(mapping = aes(x = olive_var_short, y = Chao1)) +
+  geom_jitter(mapping=aes(shape = sample_type, color = olive_trade_prep, 
+                          alpha = Duration_of_fermentation_d)) +
+  scale_shape_manual(values=c(16,17,15,18)) +
+  scale_alpha_continuous(range = c (0.3,1)) +
+  theme_bw()
+
+# as an alternative create a new variable and use categories
+
+alpha_div_fungi <- alpha_div_wmetadata |>
+  mutate(stage_category = case_when(
+    nature == "Raw" ~ 1,
+    nature == "Intermediate" ~ 2,
+    nature == "Finished" ~ 3,
+    .default = 0
+  ))
+
+alpha_div_fungi_plot <- alpha_div_fungi |>
+  ggplot(mapping = aes(x = olive_var_short, y = Chao1)) +
+  geom_boxplot() +
+  geom_jitter(mapping=aes(shape = sample_type, color = ripe_trade,
+                          size = stage_category), alpha = I(0.5)) +
+  labs(
+    x = "olive variety",
+    color = "olive ripe. + trade prep.",
+    shape = "sample type",
+    size = "stage"
+  ) +
+  scale_shape_manual(values=c(1,2,0,5)) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  theme_bw()
+alpha_div_fungi_plot
+out_fn <- file.path(out_folder, str_c(outfn_prefix,"_alphadivfungi",gfileext)) 
+
+if(savegraph) ggsave(alpha_div_fungi_plot, filename = out_fn, dpi = graphresolution)
+
+
+
+# is there a relationship between number of sequences and diversity?
+alpha_div_fungi |>
+  ggplot(mapping = aes(x = n_reads2, y = Chao1)) +
+  geom_point()
+summary(lm(Chao1~n_reads2, data = alpha_div_wmetadata))
+# not really
+
+# is there a relationship with addition of starters?
+# first, which studies have a combination of starter and no starter?
+# xtabs(~studyId+inoculation_fortification, data = alpha_div_wmetadata)
+# ST253
+alpha_starter <- alpha_div_fungi |> 
+  dplyr::filter(studyId == "ST253") |>
+  dplyr::filter(stage_category >1) |>
+  ggplot(mapping = aes(x=inoculation_fortification, Chao1)) +
+  facet_wrap(~stage_category) +
+  geom_boxplot() +
+  geom_jitter(mapping=aes(shape = sample_type, color = ripe_trade), alpha = I(0.5)) +
+  labs(
+    x = "inoculation",
+    color = "olive ripe. + trade prep.",
+    shape = "sample type",
+    size = "stage"
+  ) +
+  scale_shape_manual(values=c(1,2,0,5)) +
+  scale_size(breaks = c(1,2,3)) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  theme_bw()
+alpha_starter
+out_fn_starter <- file.path(out_folder, str_c(outfn_prefix,"_alphadivfungi_starter",gfileext)) 
+
+if(savegraph) ggsave(alpha_starter, filename = out_fn_starter, dpi = graphresolution)
+
+# any evidence of variation with stage?
+alpha_div_stage <- alpha_div_fungi |>
+  mutate(stage_category = as.factor(stage_category)) |>
+  ggplot(mapping = aes(x=stage_category, Chao1)) +
+  facet_wrap(~str_wrap(olive_variety,15)) +
+  geom_boxplot() +
+  geom_jitter(mapping=aes(shape = sample_type, color = ripe_trade), alpha = I(0.3)) +
+  labs(
+    x = "stage",
+    color = "olive ripe. + trade prep.",
+    shape = "sample type"
+  ) +
+  scale_shape_manual(values=c(1,2,0,5)) +
+  scale_size(breaks = c(1,2,3)) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  theme_bw()
+alpha_div_stage
+out_fn <- file.path(out_folder, str_c(outfn_prefix,"_alphadivfungi_stage",gfileext)) 
+
+if(savegraph) ggsave(alpha_div_stage, filename = out_fn, dpi = graphresolution, width = 9)
+
+
+```
+
+```{r more_Chao1}
+alpha_253 <- alpha_div_fungi |>
+  dplyr::filter(studyId == "ST253" & stage_category >= 2) |>
+  dplyr::filter(Duration_of_fermentation_d >5) |>
+  select(Chao1:sampleId, description, olive_ripeness:stage_category)
+ggplot(alpha_253, mapping = aes(x = Duration_of_fermentation_d, y = Chao1, 
+       color = inoculation_fortification)) +
+  geom_point()
+ggplot(alpha_253, mapping = aes(x = factor(Duration_of_fermentation_d), y = Chao1, color = inoculation_fortification)) +
+  geom_boxplot() +
+  labs(color = "starter", x = "time, d, as factor") +
+  theme_bw()
+out_fn_253 <- file.path(out_folder, str_c(outfn_prefix,"_alphadivfungi_253",gfileext)) 
+
+if(savegraph) ggsave(filename = out_fn_253, dpi = graphresolution)
+
+alpha_239 <- alpha_div_fungi |>
+  dplyr::filter(studyId == "ST239" & (sample_type == "brine" | sample_type == "fruit")) |>
+  select(Chao1:sampleId, description, olive_ripeness:stage_category)
+
+ggplot(alpha_239, mapping = aes(x = Duration_of_fermentation_d, y = Chao1, color = sample_type)) +
+  geom_point()
+
+alpha_247 <- alpha_div_fungi |>
+  dplyr::filter(studyId == "ST247" & (sample_type == "brine" | sample_type == "fruit")) |>
+  select(Chao1:sampleId, description, olive_ripeness:stage_category)
+
+ggplot(alpha_247, mapping = aes(x = Duration_of_fermentation_d, y = Chao1, 
+       color = sample_type, shape = spoilage)) +
+  geom_point()
+
+
+```
+In study 253 a further variable is reduction of NaCl for one of the driven fermentations. I think the very high variability for one of the treatments at day 5 are a mistake. 
+
+Due to the differences in methods and experimental designs only very general conclusions can be drawn:
+
+* there is no evidence of a relationship between number of sequences and Chao1
+
+* olive variety and process are almost always confounded in the same study, therefore comparisons need to be done, at least, within the same variety  
+
+* for the single study for which inoculated and inoculated olives were compared, we found no significant evidence of lower diversity in inoculated fermentations; median Chao1 was even higher in some cases for inoculated fermentations 
+
+* there is no clear evidence of stage affecting the diversity, i.e. diversity does not apparently decrease with increasing fermentation time due to the selection of a less diverse and more adapted community, although in some environmental samples (see Nyons olives) diversity is much higher than in olives or brines.  
+
+```{r rarefy, echo = F, include = F}
+# to do, a chunk on rarefaction
+```
+
+## Filtering taxa: taxonomic agglomeration, prevalence and abundance.  
+
+I will now use a prevalence and abundance filer (a permutation filter would be more useful) and create prevalence and abundance graphs and tables. Please note that top taxa will be selected in decreasing order of importance according to one of three possible criteria: prevalence, and index obtained by multiplying prevalence and abundance, and the scores of the first component of the relative prevalence and mean abundance matrix. The current option is `r prevab_sort_option`.
+
+```{r prev_ab, echo = F}
+
+ntaxa_pre <- ntaxa(myphyseq)
+
+# keep sample sums (needed to keep track of what is happening)
+sample_sums_stage_0 <- sample_sums(myphyseq)
+
+# first filtering stage
+myphyseq_1 <- myphyseq
+# apply taxonomic filters or agglomerate
+# optionally remove fungi or Eukaryota
+if (removeOther) {
+  myphyseq_1 <- subset_taxa(myphyseq_1, taxa_names(myphyseq_1)!="Other")
+}
+if (removeChloroplast){
+  myphyseq_1 <- subset_taxa(myphyseq_1, 
+                            taxa_names(myphyseq_1)!="Chloroplast" & class!= "Chloroplast") 
+}
+if (removeMitochondria){
+  myphyseq_1 <- subset_taxa(myphyseq_1, 
+                            taxa_names(myphyseq_1)!="Mitochondria" & family != "Mitochondria")
+}
+if (removeFungi){
+  myphyseq_1 <- subset_taxa(myphyseq_1, 
+                            domain !="Mitochondria" & domain != "Fungi")
+}
+
+ntaxa_post_stage1 <- ntaxa(myphyseq_1)
+  
+# sequences after this stage
+sample_sums_stage_1 <- sample_sums(myphyseq_1)
+
+myphyseq_2 <- myphyseq_1
+run_this <-T
+#ad hoc, a mistake in lineage causes a problem in agglomeration
+if(run_this){
+  temp_tax <- as(tax_table(myphyseq_2), "matrix") |>
+    as.data.frame() |>
+    mutate(order = if_else(genus == "Rachicladosporium", "Cladosporiales", order))
+  tax_table(myphyseq_2) <- as.matrix(temp_tax)
+  }
+
+# further filtering and agglomeration (here, genus)
+if(glom_level == "none"){
+  # perform optional filtering
+  if(removeKonly){
+    myphyseq_2 <- subset_taxa(myphyseq_1, !is.na(phylum))
+  }
+} else {
+  myphyseq_2 <- tax_glom(myphyseq_2, taxrank = glom_level)
+  temp_tax <- as(tax_table(myphyseq_2), "matrix") |>
+    as.data.frame() 
+  # NOTE FOR SELF: it would be safer to change taxa labels; physeq might retain the original labels
+  # fix taxa_names
+  taxa_names(myphyseq_2) <- myphyseq_2@tax_table[,glom_level]
+}
+sample_sums_stage_2 <- sample_sums(myphyseq_2)
+
+ntaxa_post_glom <- ntaxa(myphyseq_2)
+
+# final stage, filtering with prevab/permutation filter
+myphyseq_3 <- myphyseq_2
+# skipped if filterOTUs is set to F
+# here I am filtering on prevalence and abundance, min prevalence 0.01, min abundance 0.005
+if(filterOTUs){
+  # prior to filtering must remove samples which have 0 sample_sums because
+  # of taxonomic filtering and show message
+  if(any(sample_sums(myphyseq_2)==0)){
+    myphyseq_3 <- subset_samples(myphyseq_2, sample_sums(myphyseq_2)> 0)
+    samples_removed <- names(which(sample_sums(myphyseq_2)==0))
+    cat(red("\nsamples ",toString(samples_removed), "had 0 sequences left after taxonomic filtering and were removed\n"))
+  }
+  myfilteredlist <- filter_my_taxa(myphyseq_3, 
+                                   name = "all_samples",
+                           prevfilter = prev_filter,
+                           PERFect_options = list(
+                             method = "sim", # "sim" or "perm", perm takes longer
+                             perf_alpha = 0.1, # this is the default
+                             perf_k = 10000, # this is the number of permutation, default value
+                             rollm = F, # this is the rolling mean argument
+                             perf_alg = "fast", # algorithm for permutation filtering fast or full, full is slower
+                             perf_hist = FALSE, # the hist option in PERFect_perm
+                             vrb_out = TRUE # if extra output needs to be produced
+                           ),
+                           prevthreshold = prev_threshold,
+                           passboth = pass_both,
+                           abthreshold = ab_threshold,
+                           filenm = "prevfilter",
+                           gres = 300,
+                           gtype = "tiff",
+                           saveplot = T,
+                           printplot = T,
+                           outfolder = out_folder,
+                           savepat = T
+                           )
+  # this generates a list which contains the phyloseq object
+  myphyseq_3 <- myfilteredlist$phyobj
+  ntaxa_post_prevab <- ntaxa(myphyseq_3)
+  prevab_table <- myfilteredlist$prevabtable
+  
+  # TO DO, the table is sorted by decreasing prevalence need to provide an alternative my by a weighted sum
+  # of prevalende and abundanceor something else
+  
+  filterOTU_flag <- T
+}
+
+# when assembling seq removal report need to keep into account if the length of vectors differ
+sample_sums_stage_3 <- sample_sums(myphyseq_3)
+
+if(exists("prevab_table")){
+  prevab_table <- prevab_table |>
+    mutate(label = .data[[glom_level]])
+  # print(prevab_sort_option)
+  sort_var = case_when(
+    prevab_sort_option == "decr_prev" ~ prevab_table$relprev,
+    prevab_sort_option == "decr_ab" ~ prevab_table$relAbundance,
+    prevab_sort_option == "prevab" ~ 100*prevab_table$relprev*prevab_table$relAbundance,
+    prevab_sort_option == "comp1" ~ pull(prevab_pc(prevab_df = prevab_table),Comp.1),
+    .default = prevab_table$relprev
+    )
+  prevab_table$sort_var <- sort_var
+  prevab_table <- arrange(prevab_table, desc(sort_var))
+  top_taxa <- slice(prevab_table, 1:(maxOTUcats-1))
+}
+
+kable(
+  select(top_taxa, label, phylum, class, relAbundance, relprev, sort_var),
+  caption = str_c("Top ",(maxOTUcats-1), " fungal genera in table olives and their food contact enviroments and materials in terms of prevalence and/or abundance", sep = ""), digits = dgts
+  ) |>
+  kable_classic()
+
+```
+
+Those genera do not completely cover dominating and subdominating taxa in all samples and aer more or less strongly affected by the unbalanced distribution of samples. Another option is showing, in a prevalence and abundance plot, all genera whose max abundance is > than a given threshold, say 0.01 and a given prevalence, say 0.1.  
+
+```{r more_than_one_percemt, dpi = 96}
+
+core_microbiota <- prevab_table |>
+  dplyr::filter(max_rel_ab>0.01 & relprev >0.1) 
+nrow(core_microbiota)
+core_microbiota |>
+  count(order) |>
+  arrange(desc(n))
+out_fn <- file.path(out_folder, str_c(outfn_prefix, "corefungi.txt"))
+write_tsv(core_microbiota, file = out_fn)
+
+core_plot <- core_microbiota |>
+  ggplot(mapping = aes(x = max_rel_ab, y = relprev)) +
+  geom_point(aes(colour = class)) +
+  geom_text_repel(aes(label = genus), max.overlaps = 20) +
+  labs(x = "max. rel. abundance",
+       y= "rel. prevalence") +
+  scale_color_brewer(type = "qual", palette = "Paired") +
+  theme_bw()
+print(core_plot)
+if(savegraph) ggsave(core_plot, filename = file.path(out_folder, str_c(outfn_prefix,"core_all.",graphtype)), width = 9, dpi = graphresolution)
+```
+
+Prevalence and abundance may, of course, differ in different groups of samples and is most certainly affected by the very unequal number of samples for different olive varieties. 
+
+```{r after_filtering, echo = F}
+samples_to_keep <- base::intersect(names(sample_sums_stage_0), names(sample_sums_stage_3))
+
+seq_sums_df <- tibble(sample = samples_to_keep,
+                         start = sample_sums_stage_0[samples_to_keep],
+                         first_tax_filter = sample_sums_stage_1[samples_to_keep],
+                         tax_glom = sample_sums_stage_2[samples_to_keep],
+                         final_filt = sample_sums_stage_3[samples_to_keep])
+seq_sums_df <- seq_sums_df |>
+  mutate(prop_left = final_filt/start)
+
+if(verbose_output) print(seq_sums_df, digits = dgts)
+
+summary(ecdf(seq_sums_df$prop_left))
+plot(ecdf(seq_sums_df$prop_left))
+
+```
+For some samples a large number of sequences was lost because of poor taxonomic assignment.  
+There is also a risk that, in ordering the genera on the basis of the first principal component of prevalence and abundance, when choosing a subset of the most relevant taxa, some which are relevant only in a subset of samples will be discarderd. 
+
+I will now repeat the filtering for the main groups of olives (Green Spanish style, Green Natural, Olives turning color Natural, Black Natural); environmental samples, which are found solely in the Nyons data sets, will be discarded.  
+
+```{r prevab_by_group, dpi = 96, echo = F}
+
+# final stage, filtering with prevab/permutation filter, for natural olives
+ripe_trade_groups <- distinct(sample_data_F_extra, ripe_trade) |>
+  pull()
+# ad hoc to remove unknown
+ripe_trade_groups <- ripe_trade_groups[1:3]
+
+# remove environment only
+myphyseq_2_no_env <- subset_samples(myphyseq_2, !str_detect(sample_type, "contact"))
+# nsamples(myphyseq_2_no_env)
+
+# fix taxa_names
+if(glom_level !="none"){
+  taxa_names(myphyseq_2_no_env) <- myphyseq_2_no_env@tax_table[,glom_level]
+}
+
+# create container
+prevab_by_ripe_trade <- vector(mode = "list", length = length(ripe_trade_groups))
+
+# ad hoc
+for(i in seq_along(ripe_trade_groups)){
+  myphyseq_3_temp <- subset_samples(myphyseq_2_no_env, ripe_trade == ripe_trade_groups[[i]])
+  if(filterOTUs){
+    # prior to filtering must remove samples which have 0 sample_sums because
+    # of taxonomic filtering and show message
+    if(any(sample_sums(myphyseq_3_temp)==0)){
+      myphyseq_3_temp <- subset_samples(myphyseq_3_temp, sample_sums(myphyseq_3_temp)> 0)
+    }
+    myfilteredlist_temp <- filter_my_taxa(myphyseq_3_temp, 
+                                          name = ripe_trade_groups[[i]],
+                                          prevfilter = prev_filter,
+                                          PERFect_options = list(
+                                            method = "sim", # "sim" or "perm", perm takes longer
+                                            perf_alpha = 0.1, # this is the default
+                                            perf_k = 10000, # this is the number of permutation, default value
+                                            rollm = F, # this is the rolling mean argument
+                                            perf_alg = "fast", # algorithm for permutation filtering fast or full, full is slower
+                                            perf_hist = FALSE, # the hist option in PERFect_perm
+                                            vrb_out = TRUE # if extra output needs to be produced
+                                          ),
+                                          prevthreshold = prev_threshold,
+                                          passboth = pass_both,
+                                          abthreshold = ab_threshold,
+                                          filenm = str_c("prevfilter", ripe_trade_groups[[i]]),
+                                          gres = 300,
+                                          gtype = "tiff",
+                                          saveplot = T,
+                                          printplot = T,
+                                          outfolder = out_folder,
+                                          savepat = T
+    )
+    prevab_by_ripe_trade[[i]] <- myfilteredlist_temp
+    names(prevab_by_ripe_trade)[i] <- ripe_trade_groups[[i]]
+  }
+  
+  prevab_table_temp <- myfilteredlist_temp$prevabtable  
+  
+  if(exists("prevab_table_temp")){
+    # print(prevab_sort_option)
+    sort_var_temp = case_when(
+      prevab_sort_option == "decr_prev" ~ prevab_table_temp$relprev,
+      prevab_sort_option == "decr_ab" ~ prevab_table_temp$relAbundance,
+      prevab_sort_option == "prevab" ~ 100*prevab_table_temp$relprev*prevab_table_temp$relAbundance,
+      prevab_sort_option == "comp1" ~ pull(prevab_pc(prevab_df = prevab_table_temp),Comp.1),
+      .default = prevab_table_temp$relprev
+    )
+    prevab_table_temp$sort_var <- sort_var_temp
+    prevab_table_temp <- arrange(prevab_table_temp, desc(sort_var))
+    top_taxa_temp <- slice(prevab_table_temp, 1:(maxOTUcats-1))
+    print(
+      kable(
+        select(top_taxa_temp, label, phylum, class, relAbundance, relprev, sort_var),
+        caption = str_c("Top ", (maxOTUcats-1), 
+                        " fungal genera in table olives in terms of prevalence and/or abundance, ",
+                        ripe_trade_groups[[i]], sep = ""), digits = dgts
+      ))
+    cat("\n")
+  }
+  
+}
+
+
+
+# clean up
+rm(myphyseq_3_temp, myfilteredlist_temp, prevab_table_temp, i )
+gc()
+
+
+```
+
+
+As expected, the pattern of most abundant and prevalent genera is different in each group.  
+Therefore, to avoid the possibility that a taxon that is important in a group but not in another is discarded, we created a list of taxa to be retained which was the union of taxa retained in each group.
+
+```{r modified_filter}
+
+prevab_all <- map(prevab_by_ripe_trade, \(x) pluck(x,"prevabtable")) |>
+  list_rbind(names_to = "ripe_trade") |>
+  dplyr::filter(pass_filters == "T")
+
+taxa_to_keep <- distinct(prevab_all, label) |> pull()
+
+myfiltphyseq <- subset_taxa(myphyseq_2, taxa_names(myphyseq_2) %in% taxa_to_keep)
+
+```
+
+
+# The most abundant genera.
+
+I will now create box plots and bar plots by group, using olive or brine samples only, with the 30 most prevalent and abundant genera. I will use all sample categories.  
+It might also be interesting to show the distribution in different families.
+
+```{r top_taxa_box_plot, dpi = 96}
+# get the taxa in the core microbiota
+core_label <- core_microbiota$label
+# create a phyloseq with relative abundances, preserving the OTUs which were not filtered
+myphyseq_2_relab <- transform_sample_counts(myphyseq_2, \(x) x/sum(x))
+# melt and select only essential variables
+myphyseq_2_melt <- psmelt(myphyseq_2_relab) |>
+  select(OTU:studyId,s_type,L1:spoil_ferm, olive_variety:inoculation_fortification,
+         olive_var_short, ripe_trade, class,family,genus)
+# create stage variable
+myphyseq_2_melt <- myphyseq_2_melt |> mutate(stage_category = case_when(
+    nature == "Raw" ~ 1,
+    nature == "Intermediate" ~ 2,
+    nature == "Finished" ~ 3,
+    .default = 0
+  ))
+
+# filter for the top 30
+myphyseq_2_melt_core <- myphyseq_2_melt |> dplyr::filter(OTU %in% core_label)
+
+# need a reasonable ordering for x axis
+order_x <- myphyseq_2_melt_core |>
+  select(OTU, family) |>
+  distinct() |>
+  arrange(family, OTU) |>
+  pull(OTU)
+# too many varieties
+core_fungi_all <- myphyseq_2_melt_core |>
+  dplyr::filter(!str_detect(sample_type, "contact")) |>
+  mutate(OTU = factor(OTU, levels = order_x)) |>
+  ggplot(mapping = aes(x = OTU, y = log10(Abundance))) +
+  geom_jitter(alpha = I(0.1)) +
+  facet_wrap(~ripe_trade) +
+  geom_boxplot(alpha=I(0.5)) +
+  labs(y = "log10(rel. abund.)") +
+  scale_color_brewer(type = "qual", palette = "Paired") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, face = "italic"))
+core_fungi_all
+out_fn <- file.path(out_folder,str_c(outfn_prefix, "boxplotcore.",graphtype))
+if(savegraph) ggsave(core_fungi_all, file = out_fn, dpi = graphresolution, width = 9)
+```
+
+This plot gives emphasis to variability, but it is strongly affected by unequal sampling levels, especially for black and turning color natural categories (almost all samples are from Nyons olives in the first case). Plots for individual families are shown below.  
+
+```{r boxplot_pichiaceae, dpi = 96}
+# try with subgroups
+# Pichiaceae, only those passing filter
+Pic_pass_filter <- prevab_table |>
+  dplyr::filter(pass_filters == "T" & (family == "Pichiaceae")) |>
+  select(label, family, genus) |>
+  arrange(family, genus) |>
+  pull(label)
+
+myphyseq_2_melt |>
+  dplyr::filter(OTU %in% Pic_pass_filter) |>
+  mutate(OTU=factor(OTU, levels = Pic_pass_filter)) |> 
+  ggplot(mapping = aes(x = OTU, y = log10(Abundance))) +
+  geom_jitter(aes(shape = inoculation_fortification), alpha = I(0.1)) +
+  facet_wrap(~ripe_trade) +
+  geom_boxplot(alpha=I(0.5)) +
+  labs(y = "log10(rel. abund.)") +
+  scale_color_brewer(type = "qual", palette = "Paired") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, face = "italic"))
+if(savegraph) ggsave(file.path(out_folder,str_c(outfn_prefix, "boxplotpichiaceae.",graphtype)), dpi = graphresolution)
+
+```
+
+The Pichiaceae plot is simpler to interpret and also shows some minor or more rare genera. 
+
+```{r boxplot_sac, dpi = 96}
+# Saccharomycetaceae
+
+Sac_pass_filter <- prevab_table |>
+  dplyr::filter(pass_filters == "T" & family == "Saccharomycetaceae") |>
+  select(label, family, genus) |>
+  arrange(family, genus) |>
+  pull(label)
+
+
+myphyseq_2_melt |>
+  dplyr::filter((OTU %in% Sac_pass_filter)) |>
+  mutate(OTU=factor(OTU, levels = Sac_pass_filter)) |> 
+  ggplot(mapping = aes(x = OTU, y = log10(Abundance))) +
+  geom_jitter(aes(shape = inoculation_fortification), alpha = I(0.3)) +
+  facet_wrap(~ripe_trade) +
+  geom_boxplot(alpha=I(0.5)) +
+  labs(y = "log10(rel. abund.)") +
+  scale_color_brewer(type = "qual", palette = "Paired") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, face = "italic"))
+if(savegraph) ggsave(file.path(out_folder,str_c(outfn_prefix, "boxplotsac.",graphtype)), dpi = graphresolution)
+
+
+```
+The prevalence and abundance is very clearly affected by olive ripeness and trade preparation but also by variety.  
+Must check in Penland et al. if they have proven that salt is a source.  
+
+Finally, individual plots for different combination of ripeness and trade are shown below.
+
+```{r box_plot_olive_groups, dpi = 96}
+# black natural
+black_nat_core <- myphyseq_2_melt_core |>
+  dplyr::filter(!str_detect(sample_type, "contact") & ripe_trade == "Black Natural") |>
+  mutate(OTU = factor(OTU, levels = order_x)) |>
+  ggplot(mapping = aes(x = OTU, y = log10(Abundance))) +
+  geom_boxplot(alpha=I(0.3)) +
+  geom_jitter(aes(color = olive_var_short, alpha = stage_category)) +
+  labs(y = "log10(rel. abund.)", color = "olive var.") +
+  scale_color_brewer(type = "qual", palette = "Paired") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, face = "italic"))
+black_nat_core 
+if(savegraph) ggsave(black_nat_core, filename = file.path(out_folder,str_c(outfn_prefix, "boxplotblnatcore.",graphtype)), dpi = graphresolution, width = 9)
+# green alkali treated
+green_alk_core <- myphyseq_2_melt_core |>
+  dplyr::filter(!str_detect(sample_type, "contact") & ripe_trade == "Green Alkali treated") |>
+  mutate(OTU = factor(OTU, levels = order_x)) |>
+  ggplot(mapping = aes(x = OTU, y = log10(Abundance))) +
+  geom_boxplot(alpha=I(0.3)) +
+  geom_jitter(aes(color = olive_var_short, alpha = stage_category)) +
+  labs(y = "log10(rel. abund.)", color = "olive var.") +
+  scale_color_brewer(type = "qual", palette = "Paired") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, face = "italic"))
+green_alk_core 
+if(savegraph) ggsave(green_alk_core, filename = file.path(out_folder,str_c(outfn_prefix, "boxplotgreenalkcore.",graphtype)), dpi = graphresolution, width = 9)
+#green natural
+# green alkali treated
+green_nat_core <- myphyseq_2_melt_core |>
+  dplyr::filter(!str_detect(sample_type, "contact") & ripe_trade == "Green Natural") |>
+  mutate(OTU = factor(OTU, levels = order_x)) |>
+  ggplot(mapping = aes(x = OTU, y = log10(Abundance))) +
+  geom_boxplot(alpha=I(0.3)) +
+  geom_jitter(aes(color = olive_var_short, alpha = stage_category)) +
+  labs(y = "log10(rel. abund.)", color = "olive var.") +
+  scale_color_brewer(type = "qual", palette = "Paired") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, face = "italic"))
+green_nat_core 
+if(savegraph) ggsave(green_nat_core, filename = file.path(out_folder,str_c(outfn_prefix, "boxplotgreennatcore.",graphtype)), dpi = graphresolution, width = 9)
+
+
+```
+
+
+## A bar plot.  
+
+Finally, I will try to depict the composition of the dominant microbiota different olive varieties at different stages of fermentation. The data are very unbalanced and, especially for very long fermentations (Nyons, Itrana), the stage 2 may pool together samples which are very far apart in time.  
+
+```{r top_taxa_barplot, echo = F, dpi = 72}
+
+# use the core_microbiota subset as starting point
+
+# get the OTU table
+OTU_mat_f <- as(otu_table(myfiltphyseq), "matrix")
+if (myfiltphyseq@otu_table@taxa_are_rows) {
+    OTU_mat_f <- t(OTU_mat_f)
+}  
+# calculate OTU sums by sample
+OTU_mat_f_sums <- rowSums(OTU_mat_f)
+# extract top_taxa
+OTU_mat_f_core <- OTU_mat_f[,core_microbiota$label]
+coresums <- rowSums(OTU_mat_f_core)
+Other <- OTU_mat_f_sums-coresums
+OTU_mat_f_coreo <- cbind(OTU_mat_f_core, Other)
+# make a tibble
+OTU_mat_f_coreo <- as_tibble(OTU_mat_f_coreo, rownames="Run")
+# pivot longer and remove 0s
+OTU_tibble_long <- pivot_longer(OTU_mat_f_coreo, cols = 2:ncol(OTU_mat_f_coreo),
+                                names_to = "label", values_to = "nseq") |>
+  dplyr::filter(nseq>0) 
+
+# join sample metadata
+OTU_tibble_long <- left_join(OTU_tibble_long, sample_data_F_2)
+
+# join taxa metadata
+
+OTU_tibble_long <- left_join(OTU_tibble_long,
+                             select(core_microbiota, label, domain:family))
+if(glom_level != "none"){
+  var <- "label"
+  OTU_tibble_long <- mutate(OTU_tibble_long, 
+                            tax_name = if_else(label !="Other", .data[[var]], "Other")) %>%
+    mutate(stage_category = case_when(
+    nature == "Raw" ~ 1,
+    nature == "Intermediate" ~ 2,
+    nature == "Finished" ~ 3,
+    .default = 0
+  ))
+  
+}
+
+# OK now let's group samples (I am using this method to create a Shiny app later)
+grouping_vars <- c("ripe_trade", "group_short", "stage_category", "tax_name")
+
+OTU_tibble_sums <- OTU_tibble_long %>%
+  summarise(seq_sums = sum(nseq), .by = all_of(grouping_vars))
+# make the taxa labels a factor, reordered on the basis of family
+order_sums <- core_microbiota |>
+  select(label, family) |>
+  distinct() |>
+  arrange(family, label) |>
+  pull(label)
+order_sums %in% unique(OTU_tibble_sums$tax_name)
+
+OTU_tibble_sums <- OTU_tibble_sums |>
+  mutate(tax_name = factor(tax_name, levels = c(order_sums, "Other")))
+
+# make a qualitative color palette
+n_taxa <- nrow(core_microbiota)+1
+rpalette <- distinctColorPalette(n_taxa)
+names(rpalette) <- NULL
+
+
+if(maxOTUcats<=11){
+  OTU_tibble_sums %>%
+    ggplot(mapping = aes(x = group_short, y  = seq_sums, fill = tax_name)) +
+    facet_grid(stage_category ~ str_wrap(ripe_trade,20), scales = "free_x") +
+    geom_col(position = "fill") +
+    scale_fill_brewer(type = "qual", palette = "Paired") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+} else {
+    OTU_tibble_sums %>%
+    ggplot(mapping = aes(x = group_short, y  = seq_sums, fill = tax_name)) +
+    facet_grid(stage_category ~ str_wrap(ripe_trade,20), scales = "free_x") +
+    geom_col(position = "fill") +
+    scale_fill_manual(values = rpalette[1:n_taxa]) +
+    labs(fill = NULL) +
+    guides(fill = guide_legend(ncol = 5)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+          legend.position = "bottom")
+}
+# this should be conditional to savegraph
+if(savegraph) ggsave(filename = file.path(out_folder, str_c("totaxabchart_F", gfileext, sep="")), 
+       dpi = graphresolution, width = 9, height = 9,
+       units = "in")
+```
+
+This display gives emphasis to a comparison between different trade preparations for the same category at the same time stage. Of course a different emphasis could be used. 
+Apparently, even selecting a high number of dominating genera (31) we are unable to cover all the diversity in table olives.
+It is worth noticing that the taxonomic group "Other" may be taken, generally speaking, as a measure of diversity: the larger the section, the larger the diversity. This is clearly visible in the raw fruits. The "2" category pools all the samples during fermentation, some of which can be several months apart.  
+In several, but not all cases, the composition of the fungal microbiota of brine and fruit and, when available, olive contact surfaces and material, differ within the same variety.     
+In addition, the display is clearly dominated by the varieties for which more data are available. Note also that here spoiled or inoculated samples are pooled with the others.   
+
+## A multidimensional scaling, fast and dirty.  
+
+Here I will not insist much on beta diversity: the choice of graph and analyses should be guided by scientific questions. I will only perform a fast and dirty non-metric multidimensional scaling on the Bray-Curtis distance matrix and enrich the plot with metadata. I think using the bipartite package might also be interesting to detect modules and to calculate statistics on nodes, but a reasonable grouping of samples must be found.  
+
+```{r MDS, echo = F, }
+
+myord <- ordinate(myphyseq_3, method = "NMDS", distance = "bray", trymax = 30)
+
+# NOTE for self if I ever need explained variance # https://cran.r-project.org/web/packages/vegan/vignettes/FAQ-vegan.html
+# extract coordinates of samples, add metadata
+sample_scores <- as_tibble(myord$points, rownames = "Run") |>
+  left_join(sample_data_F_2) |>
+mutate(stage_category = case_when(
+    nature == "Raw" ~ 1,
+    nature == "Intermediate" ~ 2,
+    nature == "Finished" ~ 3,
+    .default = 0
+  ))
+
+sample_scores |>
+  ggplot(mapping = aes(x= MDS1, y = MDS2)) +
+  geom_point(mapping=aes(shape = sample_type, colour = inoculation_fortification, 
+                         fill = ripe_trade, 
+                         size = stage_category), alpha = I(0.5), stroke = 1) +
+  geom_text(mapping = aes(label = olive_var_short), alpha = I(0.3), size = 2) +
+  labs(fill = NULL, colour = NULL, shape = NULL, size = "stage") +
+  scale_shape_manual(values=c(21,24,22,23)) +
+  scale_colour_manual(values = c("blue","grey","red")) +
+  scale_fill_brewer(type = "qual", palette = "Set3") +
+  guides(fill = guide_legend("trade prep", override.aes = list(shape = 21))) +
+  theme_bw()
+if(savegraph) ggsave(filename = file.path(out_folder, str_c("NMDSsamples", gfileext, sep="")), 
+       dpi = graphresolution, width = graphsizein, height = graphsizein,
+       units = "in")
+
+
+```
+
+The ordination is far from ideal, with final stress oscillating arounf 0.235. There is still the problem of showing spoiled samples...
+Anyway, olive variety seems more important than other factors and the addition of starters does not necessarily make a big difference.  
+I should also consider not using stage 0 for brine, to make comparison with fruits of the same stage possible. This can possibly be done using the fermentation time rather than the nature field. I think it can be done programmatically with some effort. It is also possible that there are too many features in the same graph.  
+
+I am now trying to show spoilage rather than inoculation.
+
+```{r NMDS_spoilage, dpi = 96}
+sample_scores |>
+  ggplot(mapping = aes(x= MDS1, y = MDS2)) +
+  geom_point(mapping=aes(shape = sample_type, colour = spoilage, 
+                         fill = ripe_trade, 
+                         size = stage_category), alpha = I(0.5), stroke = 1) +
+  geom_text(mapping = aes(label = olive_var_short), alpha = I(0.3), size = 2) +
+  labs(fill = NULL, colour = NULL, shape = NULL, size = "stage") +
+  scale_shape_manual(values=c(21,24,22,23)) +
+  scale_colour_manual(values = c("blue","red", "green")) +
+  scale_fill_brewer(type = "qual", palette = "Set3") +
+  guides(fill = guide_legend("trade prep", override.aes = list(shape = 21))) +
+  theme_bw()
+if(savegraph) ggsave(filename = file.path(out_folder, str_c("NMDSsamples_spoilage", gfileext, sep="")), 
+       dpi = graphresolution, width = graphsizein, height = graphsizein,
+       units = "in")
+```
+
+
+```{r species}
+genus_tibble <- as(tax_table(myphyseq_3), "matrix") |>
+  as_tibble(rownames = "tlabel")
+
+taxa_scores <- as_tibble(myord$species, rownames = "tlabel") |>
+  left_join(genus_tibble)
+
+taxa_scores |> 
+  dplyr::filter(genus %in% top_taxa$genus) |>
+  ggplot(mapping=aes(x=MDS1, y = MDS2, color = class)) +
+  geom_point() +
+  geom_text(mapping= aes(label=genus), show_legend = F)
+
+```
+## More things to try.  
+
+I could try a constrained ordination, but frankly the dataset is too unbalanced and the ordination would probably be driven by the two varieties which have the most samples (Nyons and Itrana) which are also confounded with the variable ripe_trade.  
+
+# References.  
+
+Here are the references for the studies retrieved from FMBN.  
+
+```{r references, echo = F}
+references <- tibble(studyId = rep("Foodmicrobionet",4),
+                     ref_complete = c(
+                       paste0("Parente, E., Cocolin, L., De Filippis, F., Zotta, T., ",
+                              "Ferrocino, I., O’Sullivan, O., Neviani, E., De Angelis, ",
+                              "M., Cotter, P. D., Ercolini, D. 2016. FoodMicrobionet: a ",
+                              "database for the visualisation and exploration of food ",
+                              "bacterial communities based on network analysis. Int. J. ",
+                              "Food Microbiol. 219: 28-37.", sep =""),
+                       paste0("De Filippis, F., Parente, E., Zotta, T., Ercolini, D. 2018.", 
+                              "A comparison of bioinformatic approaches for 16S rRNA gene ",
+                              "profiling of food bacterial microbiota. Int. J. Food Microbiol. 265:9-17.",
+                              sep = ""),
+                       paste0("Parente, E., De Filippis, F., Ercolini, D., Ricciardi, A., Zotta, T., 2019. ", 
+                              "Advancing integration of data on food microbiome studies: FoodMicrobionet ",
+                              "3.1, a major upgrade of the FoodMicrobionet database. Int. J. Food Microbiol. 305:108249.",
+                              sep = ""),
+                       paste0("Parente, E., Zotta, T., Ricciardi, A., 2022. ", 
+                              "FoodMicrobionet v4: A large, integrated, open and transparent database for food bacterial communities. ",
+                              "Int J Food Microbiol 372, 109696.",
+                              sep = "")),
+                     DOI = c("10.1016/j.ijfoodmicro.2015.12.001",
+                             "10.1016/j.ijfoodmicro.2017.10.028",
+                             "10.1016/j.ijfoodmicro.2019.108249",
+                             "10.1016/j.ijfoodmicro.2022.109696")
+)
+references <- bind_rows(references,
+                        select(studies_F, studyId, ref_complete, DOI))
+kable(references, style = "html")
+```
+
+
+
+# Credits and copyright.
+
+This is version 0.3.1 of the script, 18/2/25.  
+
+The code for loading packages is derived from [this post](http://tinyurl.com/jjwyzph).  
+The code for making qualitative random palette is derived from [this article](http://tinyurl.com/hawqufy).  
+The code for heat maps is modified from an article on the [Molecular ecologist blog](http://tinyurl.com/hxxbmvz).
+
+Assume that the code in this document is overall under MIT licence
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions: THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+## Citations for R packages used in this document.  
+
+```{r r_packages, echo=F, include = T}
+all_packages <- c("base", .cran_packages, .bioc_packages)
+print(map(all_packages, citation, auto = T), bibtex = F)
+
+```
+
+## Session report 
+This script has been tested with R 4.3.3, x86 build, on a MacBook Pro 14 inch, 2021, with chip Apple M1 Pro and 16 GB RAM and on a MacStudio 2023 with Apple M2 Max chip, both running MacOs Sonoma 12.3.1
+
+
+```{r not_run, eval = F}
+sessionInfo()
+```
+
+## Acknowledgements 
+
+This work was was carried out within the PRIN 2022 Project METAOlive 2022NN28ZZ and received funding from the European Union Next-GenerationEU, CUP C53D23005460006 (PIANO NAZIONALE DI RIPRESA E RESILIENZA (PNRR) – MISSIONE 4 COMPONENTE 2,  INVESTIMENTO 1.4 – D.D. 1048 14/07/2023). This script and its contents reflects only the authors’ views and opinions,  neither the European Union nor the European Commission can be considered  responsible for them.
