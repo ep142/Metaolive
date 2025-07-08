@@ -10,7 +10,9 @@ Next-GenerationEU - PIANO NAZIONALE DI RIPRESA E RESILIENZA (PNRR).
 including an extra_metadata file with further metadaa for bacgterial samples) 
 on olive fermentations extracted from [FoodMicrobionet v5](https://github.com/ep142/FoodMicrobionet). 
 Data for bacteria have been used in a poster presented at the [Food Systems Microbiomes](https://foodsystemsmicrobiomes.org) 
-conference and at the AJLAB meeting, on 9/8/2024. 
+conference and at the AJLAB meeting, on 9/8/2024. Those on bacteria and fungi are about to be published in IJFM.
 
 Please cite as:
 Parente E., Ricciardi A., Hidalgo M. 2024. PS2-S9-PP01 The bacterial microbiota of table olives: A metastudy. in: Proceedings of the Food Systems Microbiomes conference, p. 138 Turin, 14-17/5/2024
+Ricciardi, A., Arroyo López, F. N., Giavalisco, M., Pietrafesa, R., Parente, E. 2025. Determining the core bacterial and fungal genera in table olive fermentations. biorXiv https://doi.org/10.1101/2025.03.16.643505 (accepted on IJFM)
+
