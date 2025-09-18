@@ -1,6 +1,6 @@
-# Olive_extract_studies v2_0_1
+# Olive_extract_studies v2_0_2
 
-# this version was run on FMBN 5_0_1 on 6/9/2024
+# this version was run on FMBN 5_1_2 on 16/9/202
 # REMINDER, EACH TIME I NEED TO MAKE SURE THAT THE PHYLOSEQ LISTS INCLUDE ALL STUDIES
 
 # a script designed to extract studies from FoodMicrobionet 5 for the
@@ -110,7 +110,7 @@ make_phyloseqs <- function(samples, edges, taxa, samples_to_process, study_name,
 
 # load FMBN ---------------------------------------------------------------
 
-# I am using FMBN_plus, version 5_0_1, in a folder named FMBN
+# I am using FMBN_plus, version 5.1.2, in a folder named FMBN
 FMBN_path <- file.path("FMBN", "FMBN_plus.rds") 
 FMBN <- readRDS(FMBN_path)
 
@@ -122,11 +122,11 @@ studies_filt <- studies %>%
   dplyr::filter(str_detect(bioinf_software, "R dada2")) %>%
   dplyr::filter(str_detect(short_descr, "olive|olives|Olive|Olives") & food_group == "Vegetables")
 
-# 17 studies remaining
+# 20 studies remaining
 nrow(studies_filt)
 
 # save the studies table
-write_tsv(studies_filt, "FMBN_5_0_1_olive_studies.txt")
+write_tsv(studies_filt, "FMBN_5_1_2_olive_studies.txt")
 
 
 # get edges, samples, taxa for bacteria ------------------------------------------------
@@ -185,8 +185,14 @@ if (!dir.exists("physeqs_F")) dir.create("physeqs_F")
 # optionally start logging
 if(debug_mode) selsampleslog_B <- log_open(file_name = file.path("debugging_logs","selsamples_B.log"))
 
+# check for duplicates in samples_B%SRA_run
+any(duplicated(samples_B$SRA_run))
+# possibily one in study 302
+samples_B[duplicated(samples_B$SRA_run),]
+
 # loop over the selected studies, putting the samples to process in a phyloseq in a list
 samples_to_physeq_B <- vector(mode = "list")
+
 # filter the studies
 studies_filt_B <- studies_filt |>
   dplyr::filter(str_detect(target, "16S"))
@@ -243,6 +249,11 @@ if(keep_time) toc()
 
 # optionally start logging
 if(debug_mode) selsampleslog_F <- log_open(file_name = file.path("debugging_logs","selsamples_F.log"))
+
+# check for duplicates in samples_B%SRA_run
+any(duplicated(samples_F$SRA_run))
+# possibily one in study 302
+# samples_B[duplicated(samples_F$SRA_run),]
 
 # loop over the selected studies, putting the samples to process in a phyloseq in a list
 samples_to_physeq_F <- vector(mode = "list")
@@ -324,16 +335,17 @@ merged_physeq_B <- merge_phyloseq(physeq_list_B[[1]], physeq_list_B[[2]],
                                 physeq_list_B[[7]], physeq_list_B[[8]],
                                 physeq_list_B[[9]], physeq_list_B[[10]],
                                 physeq_list_B[[11]], physeq_list_B[[12]], 
-                                physeq_list_B[[13]], physeq_list_B[[14]])
+                                physeq_list_B[[13]], physeq_list_B[[14]],
+                                physeq_list_B[[15]])
 
 # quick check
 View(as(otu_table(merged_physeq_B), "matrix"))
 View(as(sample_data(merged_physeq_B), "data.frame"))
 
 # save
-saveRDS(merged_physeq_B, file = "olive_FMBN_5_B_phy.rds")
+saveRDS(merged_physeq_B, file = "olive_FMBN_5_1_B_phy.rds")
 sample_data <- as(sample_data(merged_physeq_B), "data.frame")
-write_tsv(sample_data, file = "olive_FMBN_5_B_sample_data.txt")
+write_tsv(sample_data, file = "olive_FMBN_5_1_B_sample_data.txt")
 
 # fungi
 # I need to remove all the studies which have a suffix like sample, environment
@@ -362,9 +374,9 @@ View(as(otu_table(merged_physeq_F), "matrix"))
 View(as(sample_data(merged_physeq_F), "data.frame"))
 
 # save
-saveRDS(merged_physeq_F, file = "olive_FMBN_5_F_phy.rds")
+saveRDS(merged_physeq_F, file = "olive_FMBN_5_1_F_phy.rds")
 sample_data <- as(sample_data(merged_physeq_F), "data.frame")
-write_tsv(sample_data, file = "olive_FMBN_5_F_sample_data.txt")
+write_tsv(sample_data, file = "olive_FMBN_5_1_F_sample_data.txt")
 
 
 # Session report ----------------------------------------------------------
@@ -377,7 +389,7 @@ sessionInfo()
 # Copyright notice --------------------------------------------------------
 
 # Script created by Eugenio Parente (eugenio.parente@unibas.it), 
-# Università degli Studi della Basilicata, 2023, 2024 https://github.com/ep142
+# Università degli Studi della Basilicata, 2023, 2024, 2025 https://github.com/ep142
 # Permission is hereby granted, free of charge, to any person obtaining a copy 
 # of this software and associated documentation files (the \"Software\"), to 
 # deal in the Software without restriction, including without limitation the 
