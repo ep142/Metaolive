@@ -5,10 +5,18 @@ the "METAOLIVE: meta-omic approaches for traditional table olive fermentation"
 project (more [here](http://web.unibas.it/parente/?page_id=1945)). 
 This project is co-funded by Ministero dell’Università e della Ricerca PRIN 2022, 
 proposal 2022NN28ZZ, and received funding from the European Union 
-Next-GenerationEU - PIANO NAZIONALE DI RIPRESA E RESILIENZA (PNRR).
-olive_FMBN contains scripts and data with phyloseq objects (and their metadata; 
+Next-GenerationEU - PIANO NAZIONALE DI RIPRESA E RESILIENZA (PNRR).  
+
+* olive_FMBN folder contains scripts and data with phyloseq objects (and their metadata; 
 including an extra_metadata file with further metadata for bacterial and fungal samples) 
 on olive fermentations extracted from [FoodMicrobionet v5](https://github.com/ep142/FoodMicrobionet).  
+
+* the Misc folder contains miscellaneous scripts used to process data generated in the project:  
+
+  + skan_it_growth_curve_v0_4_1.Rmd is a Rmarkdown file designed to process in 
+  batch kinetics files generated with the [SkanIt](https://www.thermofisher.com/it/en/home/life-science/lab-equipment/microplate-instruments/plate-readers/software.html) software, fit a number of growth 
+  curve models and select the best one in terms of AIC. The current version also fits a secondary model. An example growth curve 
+  file is provided. I am pretty sure it can be adapted to other plate readers.
 
 Data for bacteria have been used in a poster presented at the 
 [Food Systems Microbiomes](https://foodsystemsmicrobiomes.org) conference,

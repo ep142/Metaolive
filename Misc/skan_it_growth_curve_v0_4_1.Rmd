@@ -1,0 +1,690 @@
+---
+title: 'A script for processing growth curve data from SkanIt software'
+subtitle: "v 0.4.1 11/8/2025"
+author: "Prof. E. Parente, DAFE, Università degli Studi della Basilicata"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    df_print: paged
+---
+
+**NOTES FOR SELF AND INSTRUCTIONS**
+
+* the data files you want to process must be in .xlsx format in the project folder; these must be the only .xlsx files present in the folder (or you need to change the code)
+* processing more than one file only makes sense if they are all from the same experiment and a common report is needed; the files should also have the same structure and a coherent system for naming of blanks and treatments  
+* when processing more than one file and in any case there are biological replicates, the replicate/file number must be included in the name of the strain (and may be split later)
+
+
+```{r setup, include=FALSE}
+
+# NOTES FOR SELF
+# in the future I might want to use nlsTools
+
+knitr::opts_chunk$set(echo = FALSE)
+
+# loading packages
+.cran_packages <- c("tidyverse", "readxl", "nlsMicrobio","crayon", 
+                    "broom", "kableExtra", "ggtext")
+
+.inst <- .cran_packages %in% installed.packages()
+if(any(!.inst)) {
+  install.packages(.cran_packages[!.inst])
+}
+sapply(.cran_packages, require, 
+       character.only = TRUE)
+
+opar <- par(no.readonly=TRUE) 
+par(ask=F) 
+set.seed(1234) 
+# options for saving
+save_graph <- T
+save_data <- T
+# output folder
+out_folder <- "gc_output"
+if((save_graph | save_data) & !dir.exists("gc_output")) dir.create("gc_output")
+fn_prefix <- "testing_gc_script"
+
+```
+# Introduction.  
+
+This script uses a parametric approach to model growth curves of microorganisms obtained from Varioskan microplate reader using the SkanIt software. The script can use the reports from multiple kinetic runs, and performs (in a semi-automated fashion) the following stept:
+
+1. import the data  
+
+2. do rough plots
+
+3. perform basic filtering   
+
+4. use a combination of dplyr and broom with nls to perform non-linear regression using parametric models (here variations of the [Baranyi and Roberts D-model](https://dx.doi.org/10.1016/0168-1605(94)90157-0); the best model is selected on the basis of the AIC)  
+
+5. plot the results and the fit  
+
+6. perform secondary modelling
+
+Two notable alternatives to this approach would be:
+
+1. QurvE: an [on-line tool](https://www.qurveanalysis.com/app/qurve) for analyzing growth curves  
+
+2. gcplyr: a [R package](https://github.com/mikeblazanin/gcplyr) which performs parametric and non parametric analysis of growth curves
+
+# Part 1. 
+
+## Importing the data.  
+
+The data must be reports exported from SkanIt kinetics module, in .xlsx format.
+
+```{r import_xlsx, warning = F, message = F}
+
+# find .xlsx files in the working directory
+file_list <- list.files()
+xlsx_files <- file_list[str_detect(file_list, "xlsx$") & !str_detect(file_list, "^~")]
+xlsx_files <- purrr::set_names(xlsx_files)
+# create a tibble for blank replacement
+blank_replacements <- tribble(
+  ~old, ~new,
+  "Blank1", "Blank_0",
+  "Blank2", "Blank_15",
+  "Blank3", "Blank_3",
+  "Blank4", "Blank_45",
+  "Blank5", "Blank_6",
+  "Blank6", "Blank_9"
+)
+# NOTE FOR SELF: I should remove those which begin with a tilde
+if(length(xlsx_files) == 1){
+  raw_gc_data <- read_xlsx(xlsx_files, skip = 9)
+  # remove the extra content
+  # which is na
+  last_row <- which(is.na(raw_gc_data[,1]))[1]-1
+  raw_gc_data <- slice(raw_gc_data, 1:last_row) |>
+    mutate(Reading = as.numeric(Reading)) |>
+    select(where(is.numeric))
+  # fix names
+  col_names_old <- colnames(raw_gc_data)
+  col_names_new <- str_replace_all(col_names_old, "\\(|\\)", "")
+  col_names_new <- str_replace_all(col_names_new, "\\[|\\]", "")
+  col_names_new <- str_replace_all(col_names_new, "\\.", "")
+  col_names_new <- str_replace_all(col_names_new, " ", "_")
+  # replace
+  colnames(raw_gc_data) <- col_names_new
+  # rename blanks
+  for(i in 1:nrow(blank_replacements)){
+    colnames(raw_gc_data) <- str_replace(colnames(raw_gc_data), 
+                                         blank_replacements$old[i],
+                                         blank_replacements$new[i])
+  }
+} else {
+  raw_gc_data_list <- map(xlsx_files, \(x) read_xlsx(x, skip = 9))
+  # process the individual files
+  for(i in seq_along(raw_gc_data_list)){
+    last_row_i <- which(is.na(raw_gc_data_list[[i]][,1]))[1]-1
+    raw_gc_data_list[[i]] <- slice(raw_gc_data_list[[i]], 1:last_row_i) |>
+      mutate(Reading = as.numeric(Reading)) |>
+      select(where(is.numeric))
+    col_names_old <- colnames(raw_gc_data_list[[i]])
+    col_names_new <- str_replace_all(col_names_old, "\\(|\\)", "")
+    col_names_new <- str_replace_all(col_names_new, "\\[|\\]", "")
+    col_names_new <- str_replace_all(col_names_new, "\\.", "")
+    col_names_new <- str_replace_all(col_names_new, " ", "_")
+    # replace
+    colnames(raw_gc_data_list[[i]]) <- col_names_new 
+    # rename blanks
+    for(j in 1:nrow(blank_replacements)){
+      colnames(raw_gc_data_list[[i]]) <- str_replace(colnames(raw_gc_data_list[[i]]), 
+                                                     blank_replacements$old[j],
+                                                     blank_replacements$new[j])
+    }
+  }
+}
+
+```
+
+## A very rough plot (no blank subtraction, no assumptions).  
+
+This is a very fast and dirty plot, carried out by averaging readings and showing them with lowess smoothing in a grid plot.  
+
+```{r rough_plot}
+if(length(xlsx_files) == 1){
+  raw_gc_data_means <- raw_gc_data |>
+    pivot_longer(3:ncol(raw_gc_data), names_to = "treatment", values_to = "OD600") |>
+    separate_wider_delim("treatment", "_", 
+                         names = c("strain", "NaCl_conc", "well")) |>
+    arrange(Reading, strain, NaCl_conc) |>
+    summarise(mean_OD = mean(OD600, na.rm = T),
+              sd_OD = sd(OD600, na.rm = T), 
+              .by = c(Reading, avg_time_s, strain, NaCl_conc)) |>
+    mutate(NaCl_conc = str_replace(NaCl_conc, "5", ".5")) |>
+    mutate(NaCl_conc = as.numeric(NaCl_conc))
+  # this is to visualize raw growth curves
+  raw_gc_data_means <- raw_gc_data_means  |>
+    mutate(time_h = avg_time_s/3600)
+  
+  raw_gc_data_means |>
+    ggplot(mapping = aes(x = time_h, y = log10(mean_OD), 
+                         color = factor(NaCl_conc))) +
+    facet_wrap(~strain) +
+    geom_smooth() +
+    labs(x = "time, h",
+         y = "log(OD600)",
+         color = "NaCl % w/v") +
+    theme_bw()
+} else {
+  raw_gc_data_means_list <- vector(mode = "list", 
+                                   length = length(raw_gc_data_list))
+  raw_gc_data_plots_list <- vector(mode = "list", 
+                                   length = length(raw_gc_data_list))
+  for(i in seq_along(raw_gc_data_list)){
+    raw_gc_data_means_list[[i]] <- raw_gc_data_list[[i]] 
+    raw_gc_data_means_list[[i]] <- raw_gc_data_means_list[[i]] |>
+      pivot_longer(3:ncol(raw_gc_data_means_list[[i]]), 
+                   names_to = "treatment", values_to = "OD600") |>
+      separate_wider_delim("treatment", "_", 
+                           names = c("strain", "NaCl_conc", "well")) |>
+      arrange(Reading, strain, NaCl_conc) |>
+      summarise(mean_OD = mean(OD600, na.rm = T),
+                sd_OD = sd(OD600, na.rm = T), 
+                .by = c(Reading, avg_time_s, strain, NaCl_conc)) |>
+      mutate(NaCl_conc = str_replace(NaCl_conc, "5", ".5")) |>
+      mutate(NaCl_conc = as.numeric(NaCl_conc))
+    
+    raw_gc_data_means_list[[i]] <- raw_gc_data_means_list[[i]]  |>
+      mutate(time_h = avg_time_s/3600)
+    
+    names(raw_gc_data_means_list)[i] <- names(raw_gc_data_list)[i]
+    # now the plot
+    plot_title <- names(raw_gc_data_means_list)[i]
+    raw_gc_data_plots_list[[i]] <- raw_gc_data_means_list[[i]] |>
+      ggplot(mapping = aes(x = time_h, y = log10(mean_OD), 
+                           color = factor(NaCl_conc))) +
+      facet_wrap(~strain) +
+      geom_smooth() +
+      labs(title = plot_title,
+           x = "time, h",
+           y = "log(OD600)",
+           color = "NaCl % w/v") +
+      theme_bw() +
+      theme(plot.title = element_text(hjust = 0.5))
+    names(raw_gc_data_plots_list)[i] <- names(raw_gc_data_list)[i]
+    print(raw_gc_data_plots_list[[i]])
+  }
+}
+```
+There is a problem with two blanks (0 and 1.5% NaCl for one experiment 270325) for which some growth after 14 h of incubation was obseerved. This will be filtered out.  
+
+```{r ad_hoc_filter}
+run_ad_hoc <- T
+if(run_ad_hoc){
+  slot_to_filter <- which(names(raw_gc_data_list) == "EspNaCl_2_270325.xlsx")
+  gc_to_filter <- raw_gc_data_list[[slot_to_filter]]
+  cols_to_mutate <- names(gc_to_filter)[str_detect(names(gc_to_filter), "_0_|_15_")]
+  time_stop <- 3600*14 
+  gc_to_filter <- gc_to_filter %>%
+    mutate(across(all_of(cols_to_mutate), ~ if_else(avg_time_s>=time_stop, NA_real_, .x)))
+  raw_gc_data_list[[slot_to_filter]] <- gc_to_filter
+}
+
+```
+
+
+## Plotting with blank subtraction.  
+
+This section prints a plot with blank absorbance removed.  
+
+```{r plot_blanked, message = F}
+
+if(length(xlsx_files) == 1){
+  # get averages for blank values
+  blank_data <- raw_gc_data |>
+    select(contains("Reading") | contains("Blank"))
+  blank_data <- blank_data |>
+    pivot_longer(2:ncol(blank_data), names_to = "treatment", values_to = "OD600") |>
+    separate_wider_delim("treatment", "_", names = c("strain", "NaCl_conc", "well")) |>
+    arrange(Reading, strain, NaCl_conc) |>
+    summarise(mean_B_OD = mean(OD600, na.rm = T), 
+              .by = c(Reading, strain, NaCl_conc))
+  # pivot the data
+  sample_data <- raw_gc_data |>
+    select(!contains("Blank")) 
+  sample_data <- sample_data |>
+    pivot_longer(3:ncol(sample_data), names_to = "treatment", values_to = "OD600") |>
+    separate_wider_delim("treatment", "_", 
+                         names = c("strain", "NaCl_conc", "well"),
+                         cols_remove = F) |>
+    arrange(Reading, strain, NaCl_conc)
+  # join blanks
+  sample_data_w_mean_blank <- left_join(
+    sample_data, select(blank_data, Reading, NaCl_conc, mean_B_OD)
+  ) |>
+    mutate(time_h = avg_time_s/3600) |>
+    mutate(NaCl_conc = str_replace(NaCl_conc, "5", ".5")) |>
+    mutate(NaCl_conc = as.numeric(NaCl_conc))
+  # substract blank
+  sample_data_w_mean_blank <- sample_data_w_mean_blank |>
+    mutate(OD600_b = if_else((OD600 - mean_B_OD)>0, (OD600 - mean_B_OD), 0))
+  # extract blanked values at time 0 for each strain
+  time_0_blanked <- sample_data_w_mean_blank |>
+    dplyr::filter(Reading == 1) |>
+    mutate(OD600_b = if_else(OD600_b>0, OD600_b, 0.0001)) |>
+    select(treatment, OD600_b0 = OD600_b)
+  # join 
+  sample_data_w_mean_blank <- sample_data_w_mean_blank |>
+    left_join(time_0_blanked) 
+  sample_data_w_mean_blank <- sample_data_w_mean_blank |>
+    mutate(lnODOD0 = log(OD600_b/OD600_b0)) |>
+    arrange(well, Reading)
+  # try with means
+  sample_data_stats <- sample_data_w_mean_blank |>
+    select(Reading, time_h, strain, NaCl_conc, OD600, OD600_b, OD600_b0) |>
+    dplyr::filter(OD600>0 & OD600_b>0 & OD600_b0>0) |>
+    summarize(mean_lnOD = mean(log(OD600), na.rm = T),
+              sd_lnOD = sd(log(OD600), na.rm = T),
+              mean_lnODb = mean(log(OD600_b), na.rm = T),
+              sd_lnODb = sd(log(OD600_b), na.rm = T),
+              mean_lnODb0 = mean(log(OD600_b0), na.rm = T),
+              sd_lnODb0 = sd(log(OD600_b0), na.rm = T),
+              .by = c(Reading, time_h, strain, NaCl_conc,)
+    ) |>
+    mutate(mean_lnODOD0 = mean_lnODb-mean_lnODb0)
+  sample_data_stats |>
+    ggplot(mapping = aes(x = time_h, y = mean_lnODb, 
+                         color = factor(NaCl_conc))) +
+    facet_wrap(~strain) +
+    geom_smooth(se = F) +
+    labs(x = "time, h",
+         y = "ln(OD)",
+         color = "NaCl % w/v")
+} else {
+  # create list for original data and stats
+  sample_data_list <- vector(mode = "list", 
+                                   length = length(raw_gc_data_list))
+  sample_data_stats_list <- vector(mode = "list", 
+                                   length = length(raw_gc_data_list))
+  names(sample_data_list) <- names(sample_data_stats_list) <- names(raw_gc_data_list)
+  # handle calculation in a loop
+  for(i in seq_along(raw_gc_data_list)){
+    blank_data_i <- raw_gc_data_list[[i]] |>
+      select(contains("Reading") | contains("Blank")) 
+    blank_data_i <- blank_data_i |>
+      pivot_longer(2:ncol(blank_data_i), names_to = "treatment", values_to = "OD600") |>
+      separate_wider_delim("treatment", "_", names = c("strain", "NaCl_conc", "well")) |>
+      arrange(Reading, strain, NaCl_conc) |>
+      summarise(mean_B_OD = mean(OD600, na.rm = T), 
+                .by = c(Reading, strain, NaCl_conc))
+    # pivot the data
+    sample_data_i <- raw_gc_data_list[[i]] |>
+      select(!contains("Blank")) 
+    sample_data_i <- sample_data_i |>
+      pivot_longer(3:ncol(sample_data_i), names_to = "treatment", values_to = "OD600") |>
+      separate_wider_delim("treatment", "_", 
+                           names = c("strain", "NaCl_conc", "well"),
+                           cols_remove = F) |>
+      arrange(Reading, strain, NaCl_conc)
+    sample_data_list[[i]] <- left_join(
+      sample_data_i, select(blank_data_i, Reading, NaCl_conc, mean_B_OD)
+    ) |>
+      mutate(time_h = avg_time_s/3600) |>
+      mutate(NaCl_conc = str_replace(NaCl_conc, "5", ".5")) |>
+      mutate(NaCl_conc = as.numeric(NaCl_conc))
+    # substract blank
+    sample_data_list[[i]] <- sample_data_list[[i]] |>
+      mutate(OD600_b = if_else((OD600 - mean_B_OD)>0, (OD600 - mean_B_OD), 0))
+    # extract blanked values at time 0 for each strain
+    time_0_blanked_i <- sample_data_list[[i]] |>
+      dplyr::filter(Reading == 1) |>
+      mutate(OD600_b = if_else(OD600_b>0, OD600_b, 0.0001)) |>
+      select(treatment, OD600_b0 = OD600_b)
+    # join 
+    sample_data_list[[i]] <- sample_data_list[[i]] |>
+      left_join(time_0_blanked_i) 
+    sample_data_list[[i]] <- sample_data_list[[i]] |>
+      mutate(lnODOD0 = log(OD600_b/OD600_b0)) |>
+      arrange(well, Reading)
+    
+    # try with means
+  sample_data_stats_list[[i]] <- sample_data_list[[i]] |>
+    select(Reading, time_h, strain, NaCl_conc, OD600, OD600_b, OD600_b0) |>
+    dplyr::filter(OD600>0 & OD600_b>0 & OD600_b0>0) |>
+    summarize(mean_lnOD = mean(log(OD600), na.rm = T),
+              sd_lnOD = sd(log(OD600), na.rm = T),
+              mean_lnODb = mean(log(OD600_b), na.rm = T),
+              sd_lnODb = sd(log(OD600_b), na.rm = T),
+              mean_lnODb0 = mean(log(OD600_b0), na.rm = T),
+              sd_lnODb0 = sd(log(OD600_b0), na.rm = T),
+              .by = c(Reading, time_h, strain, NaCl_conc,)
+    ) |>
+    mutate(mean_lnODOD0 = mean_lnODb-mean_lnODb0)
+  
+  plot_title <- names(sample_data_list)[[i]]
+  mean_plot_i <- sample_data_stats_list[[i]] |>
+    ggplot(mapping = aes(x = time_h, y = mean_lnODb, 
+                         color = factor(NaCl_conc))) +
+    facet_wrap(~strain) +
+    geom_smooth(se = F) +
+    labs(title = plot_title,
+         x = "time, h",
+         y = "ln(OD)",
+         color = "NaCl % w/v") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+  print(mean_plot_i)
+  names(sample_data_list)[i] <- names(raw_gc_data_list)[i]
+  names(sample_data_stats_list)[i] <- names(raw_gc_data_list)[i]
+  }
+  rm(blank_data_i, sample_data_i, time_0_blanked_i, mean_plot_i)
+}
+
+```
+
+# Part 2. Fitting primary and secondary models.  
+
+## Calculate growth curve parameters.  
+
+The approach is based on the creation of a long format tibble, which is then nested based on the combination of factors (strain, NaCl and, in the case of multiple files or replicates, day) and used for estimation of growth curve parameters using a custom function.
+
+```{r nls_modelling, warning = FALSE, message = FALSE, error=F}
+# prepare for fitting
+if(length(xlsx_files) == 1){
+  gc <- select(sample_data_stats, t = time_h, strain, NaCl_conc, 
+               mean_lnODb, sd_lnODb, mean_lnODb0, sd_lnODb0)
+} else {
+  # these is needed to handle replicate growth curves in different days
+  gc <- sample_data_stats_list |>
+    list_rbind(names_to = "file") |>
+    select(t = time_h, strain, NaCl_conc, 
+           mean_lnODb, sd_lnODb, mean_lnODb0, sd_lnODb0, file) |>
+    mutate(file = as.factor(file),
+           strain_code = strain) |>
+    mutate(exp = as.numeric(file)) |>
+    mutate(strain = str_c(strain,exp, sep = "_"))
+}
+
+# calculate summaries, needed for starting parameters
+gc_summaries <- gc |>
+  summarise(min_y = min(mean_lnODb),
+            max_y = max(mean_lnODb),
+            .by = c(strain, NaCl_conc))
+
+# create a nested df to be handled by purrr and broom functions
+nested_gc <- gc |>
+  select(t, strain, NaCl_conc, LOG10N = mean_lnODb) |>
+  nest(growth_curve = c(-strain, -NaCl_conc))
+
+# join the starting values
+nested_gc <- left_join(nested_gc, gc_summaries)
+
+# create a list with the models and starting values to be used (the latter as a logical)
+model_list <- list(
+  nls_models = list(b = baranyi, 
+                    bwl = baranyi_without_lag, 
+                    bwN = baranyi_without_Nmax),
+  geom_smooth_models = list(
+    b_gs = y ~ LOG10Nmax + log10((-1 + exp(mumax * lag) + exp(mumax * 
+    x))/(exp(mumax * x) - 1 + exp(mumax * lag) * 10^(LOG10Nmax - 
+    LOG10N0))),
+    bwl_gs = y ~ (LOG10Nmax - log10(1 + (10^(LOG10Nmax - LOG10N0) - 1) * 
+    exp(-mumax * x))),
+    bwN_gs = y ~ LOG10N0 + mumax * x/log(10) + log10(exp(-mumax * x) * 
+    (1 - exp(-mumax * lag)) + exp(-mumax * lag))
+  ),
+  parameter_indices = list(
+    b_p = c(mumax = T, lag = T, LOG10N0 = T, LOG10Nmax = T),
+    bwl_p = c(mumax = T, lag = F, LOG10N0 = T, LOG10Nmax = T),
+    bwN_p = c(mumax = T, lag = T, LOG10N0 = T, LOG10Nmax = F)
+  )
+  )
+
+# a function for extracting the best fitting model, if any
+extract_best_fit <- function(d, m = model_list$nls_models, 
+                             p = model_list$parameter_indices, mn, mx){ 
+  all_parameters <- list(mumax=1,
+                         lag=1, 
+                         LOG10N0 = mn, 
+                         LOG10Nmax = mx)
+  nls_fit <- vector(mode = "list", length = length(m))
+  for(i in seq_along(m)){
+    nls_fit[[i]] <- try(nls(formula = m[[i]], data = d, start = all_parameters[p[[i]]]))
+    names(nls_fit)[i] <- names(m)[i]
+  }
+  rm(i)
+  nls_fit <- nls_fit[str_detect(map_chr(nls_fit, class),"nls")]
+  # a default return value
+  glance_df <- NULL
+  tidy_df <- NULL
+  if(any(str_detect(map_chr(nls_fit, class),"nls"))){
+    glance_df <- map(nls_fit, glance) |>
+      list_rbind(names_to = "model") |>
+      arrange(AIC)
+    best_model <- glance_df$model[1]
+    glance_df <- glance_df[1,]
+    # tidy and select the best model
+    tidy_df <- map(nls_fit, \(x) try(tidy(x, conf.int = F, conf.level = 0.95))) |>
+      list_rbind(names_to = "model") |>
+      dplyr::filter(model == best_model)
+    best_fit <- nls_fit[which(names(nls_fit) == best_model)]
+  }
+  return(tdg  <- list(
+              fit = nls_fit,
+              best_fit = best_fit,
+              tidied = tidy_df,
+              glanced = glance_df
+              ))
+}
+# used for testing
+try_me <- F
+if(try_me){
+  gc1 <- nested_gc[14,] |> unnest(c(growth_curve))
+  
+  prova <- extract_best_fit(
+    d = select(gc1, t, LOG10N),
+    m = model_list$nls_models, 
+    p = model_list$parameter_indices,
+    mn = min(gc1$LOG10N),
+    mx = max(gc1$LOG10N)
+  )
+  }
+
+# data to process
+
+nls_model_list <-  pmap(.l = select(nested_gc, growth_curve, min_y, max_y),
+       .f = try(function(growth_curve, min_y, max_y){
+         gc <- growth_curve
+         mny <- min_y
+         mxy <- max_y
+         tdgl <- extract_best_fit(gc, m = model_list$nls_models, 
+                          p = model_list$parameter_indices, 
+                          mny, mxy)
+         return(tdgl$best_fit)
+         })
+       )
+
+nested_gc <- nested_gc |>
+  mutate(fits = map(nls_model_list, \(x) pluck(x,1)),
+         best_model = map_chr(nls_model_list, names)) |>
+  mutate(tidied = map(fits, tidy),
+         glanced = map(fits, glance),
+         augmented = map(fits, augment))
+# a data frame of model parameters
+v1 <- c("strain", "NaCl_conc", "best_model", "term", "estimate", "std.error", 
+    "statistic", "p.value")
+v2 <- c("strain", "NaCl_conc", "exp" ,"best_model", "term", "estimate", "std.error", 
+    "statistic", "p.value")
+fitted_values <- nested_gc |>
+  dplyr::filter(map(nested_gc$tidied, is.data.frame) |> unlist()) |>
+  unnest(cols = c(tidied))
+if(length(xlsx_files) == 1){
+  fitted_values <- select(fitted_values, any_of(v1))
+} else {
+  fitted_values <- select(fitted_values, any_of(v2))
+}
+# a data frame of glanced stats
+v1 <- c("strain", "NaCl_conc", "best_model", "sigma", "isConv", "finTol", 
+    "logLik", "AIC", "BIC", "deviance", "df.residual", "nobs")
+v2 <- c("strain", "NaCl_conc", "exp", "best_model", "sigma", "isConv", "finTol", 
+    "logLik", "AIC", "BIC", "deviance", "df.residual", "nobs")
+glanced_values <- nested_gc |>
+  dplyr::filter(map(nested_gc$glanced, is.data.frame) |> unlist()) |>
+  unnest(cols = c(glanced))
+if(length(xlsx_files) == 1){
+  glanced_values <- select(glanced_values, any_of(v1))
+} else {
+  glanced_values <- select(glanced_values, any_of(v2))
+}
+
+# a data frame of augmented values
+v1 <- c("strain", "NaCl_conc", "t", "LOG10N", ".fitted", ".resid")
+v2 <- c("strain", "NaCl_conc", "exp", "t","LOG10N", ".fitted", ".resid")
+augmented_values <- nested_gc |>
+  dplyr::filter(map(nested_gc$augmented, is.data.frame) |> unlist()) |>
+  unnest(cols = c(augmented))
+if(length(xlsx_files) == 1){
+  augmented_values <- select(augmented_values, any_of(v1))
+} else {
+  augmented_values <- select(augmented_values, any_of(v2))
+}
+augmented_values <- left_join(
+  gc,
+  select(augmented_values, strain, NaCl_conc, t, fitted =`.fitted`)
+)
+
+# save data
+if(save_data){
+  write_tsv(fitted_values, 
+            file.path(out_folder, file = str_c(fn_prefix,"_fittedgcdata.txt")))
+  write_tsv(glanced_values, 
+            file.path(out_folder, file = str_c(fn_prefix,"_goodnesoffit.txt")))
+  write_tsv(augmented_values, 
+            file.path(out_folder, file = str_c(fn_prefix,"_predictedvalues.txt")))
+}
+```
+
+The following graph shows the fitted growth curves.  
+
+```{r fitted_growth_curves, warning = F, message = F}
+fitted_curves <- augmented_values |>
+  ggplot(aes(x=t, color = factor(NaCl_conc))) +
+  geom_point(aes(y = mean_lnODb), size = I(0.1)) +
+  geom_smooth(aes(y= fitted), linewidth = I(0.5), se = F, span = 0.1) +
+  facet_wrap(~strain) +
+  labs(y = "ln(OD)", x = "t (h)", color = "NaCl, % w/v") +
+  theme_bw()
+fitted_curves
+if(save_graph){
+  graph_fn <- file.path(out_folder, str_c("fittedcurves.jpg"))
+  ggsave(fitted_curves, filename = graph_fn, dpi = 300)
+}
+
+```
+
+## Comparing µ~max~ values
+
+```{r mumaxvalues}
+# mumax values
+mumaxvalues <- fitted_values |>
+  dplyr::filter(term == "mumax") |>
+  select(strain, NaCl_conc, best_model, estimate, std.error, p.value)
+# print the table
+kable(mumaxvalues, digits = 4, caption = "Maximum specific growth rate estimates, 1/h") |>
+  kable_classic()
+
+mumax_plot <- mumaxvalues |>
+  dplyr::filter(estimate < 1.5) |>
+  mutate(sign_factor = factor(case_when(
+    p.value <=0.001 ~ "p<=0.001",
+    p.value >0.001 & p.value <=0.01 ~  "0.001 < p <=0.01",
+    p.value >0.01 & p.value <=0.05 ~ "0.01 < p <=0.05",
+    .default = "ns"
+  ), levels = c("p<=0.001", "0.001 < p <=0.01", "0.01 < p <=0.05", "ns"))) |>
+  ggplot(mapping = aes(x = NaCl_conc)) +
+  facet_wrap(~strain) +
+  geom_pointrange(aes(y = estimate, 
+                      ymin = (estimate - std.error), 
+                      ymax = (estimate + std.error),
+                      shape = sign_factor)) +
+  labs(y = "µ<sub>max</sub>, h<sup>-1</sup>",
+       x = "NaCl conc. (% w/v)",
+       shape = "significance") +
+  theme_bw() +
+  theme(
+    axis.title.x = ggtext::element_markdown(),
+    axis.title.y = ggtext::element_markdown()
+    )
+mumax_plot
+if(save_graph) ggsave(
+  mumax_plot,
+  filename = file.path(out_folder, str_c(fn_prefix,"_mumaxplot.jpg"))
+)
+```
+
+## Fitting a secondary model
+
+Attempts at fitting a non linear secondary model for µ~max~ have filed, most likely because of insufficient data points close to minimum NaCl conc. An attempt at estimating NaCl_max using a modified Ratkowky equation has also resulted in very low goodness of fit.
+
+```{r secondary_model}
+# start from the mumax data and nest
+
+mumax_nested <- mumaxvalues |>
+  mutate(sqrtmumax = sqrt(estimate),
+         aw = 1-0.006*NaCl_conc*10/58.44) |>
+  select(strain, NaCl_conc, sqrtmumax, aw) |>
+  nest(secdata = c(-strain))
+mumax_nested <- mumax_nested |>
+  mutate(sec_fits = map(mumax_nested$secdata, \(x) try(nls(formula = cpm_aw_2p, data = x, 
+                   start = list(muopt = 0.9, awmin = 0.99))))) |>
+  mutate(model_class = map_chr(sec_fits, class)) |>
+  dplyr::filter(model_class == "nls") |>
+  mutate(tidied = map(sec_fits, tidy),
+         glanced = map(sec_fits, glance))
+
+tidied_sec <- unnest(mumax_nested, cols = tidied) |>
+  select(strain, term:p.value) |>
+  pivot_wider(names_from = term, id_cols = strain, values_from = estimate:p.value) |>
+  mutate(estimate_NaCl = ((estimate_awmin-1)/-0.006)*5.844,
+         std.error_NaCl = ((estimate_awmin-std.error_awmin-1)/-0.006)*5.844-estimate_NaCl)
+
+glanced_sec <- unnest(mumax_nested, cols = glanced) |>
+  select(strain, sigma:nobs)
+
+tidied_sec_totable <- tidied_sec |>
+  select(strain, est_muopt = estimate_muopt, stderr_muopt = std.error_muopt,
+         est_NaClmax = estimate_NaCl, stderr_NaClmax = std.error_NaCl) |>
+  left_join(select(glanced_sec, strain, sigma, AIC)) |>
+  arrange(strain)
+
+kable(tidied_sec_totable, digits = 2, caption = "Estimates from the secondary model, specific growth rate, 1/h and NaCl conc max. % w/v") |>
+  kable_classic()
+
+```
+Scondary models were obtained for `r nrow(tidied_sec_totable)` out of `r nrow(mumax_nested)` strains/replicates.  
+
+
+# Credits and copyright.
+
+This is version 0.4 of the script, 11/04/2025.  
+
+The code for loading packages is derived from [this post](http://tinyurl.com/jjwyzph).  
+
+Assume that the code in this document is overall under MIT licence
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions: THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+## Citations for R packages used in this document.  
+
+```{r r_packages, echo=F, include = T}
+all_packages <- c("base", .cran_packages)
+print(map(all_packages, citation, auto = T), bibtex = F)
+
+```
+
+## Session report 
+This script has been tested with R 4.3.3 and R4.4.3, x86 build, on a MacBook Pro 14 inch, 2021, with chip Apple M3 and 16 GB RAM and on a MacStudio 2023 with Apple M2 Max chip, both running MacOs Sequoia 15.3.2
+
+
+```{r not_run, eval = F}
+sessionInfo()
+```
+
+## Acknowledgements 
+
+This work was was carried out within the PRIN 2022 Project METAOlive 2022NN28ZZ and received funding from the European Union Next-GenerationEU, CUP C53D23005460006 (PIANO NAZIONALE DI RIPRESA E RESILIENZA (PNRR) – MISSIONE 4 COMPONENTE 2,  INVESTIMENTO 1.4 – D.D. 1048 14/07/2023). This script and its contents reflects only the authors’ views and opinions,  neither the European Union nor the European Commission can be considered  responsible for them.
