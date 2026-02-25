@@ -1,6 +1,6 @@
-# Olive_extract_studies v2_0_2
+# Olive_extract_studies v2_0_3
 
-# this version was run on FMBN 5_1_2 on 16/9/202
+# this version was run on FMBN 5_1_2 on 25/02/2026
 # REMINDER, EACH TIME I NEED TO MAKE SURE THAT THE PHYLOSEQ LISTS INCLUDE ALL STUDIES
 
 # a script designed to extract studies from FoodMicrobionet 5 for the
@@ -122,7 +122,7 @@ studies_filt <- studies %>%
   dplyr::filter(str_detect(bioinf_software, "R dada2")) %>%
   dplyr::filter(str_detect(short_descr, "olive|olives|Olive|Olives") & food_group == "Vegetables")
 
-# 20 studies remaining
+# 21 studies remaining
 nrow(studies_filt)
 
 # save the studies table
@@ -187,8 +187,8 @@ if(debug_mode) selsampleslog_B <- log_open(file_name = file.path("debugging_logs
 
 # check for duplicates in samples_B%SRA_run
 any(duplicated(samples_B$SRA_run))
-# possibily one in study 302
-samples_B[duplicated(samples_B$SRA_run),]
+
+# samples_B[duplicated(samples_B$SRA_run),]
 
 # loop over the selected studies, putting the samples to process in a phyloseq in a list
 samples_to_physeq_B <- vector(mode = "list")
@@ -336,16 +336,17 @@ merged_physeq_B <- merge_phyloseq(physeq_list_B[[1]], physeq_list_B[[2]],
                                 physeq_list_B[[9]], physeq_list_B[[10]],
                                 physeq_list_B[[11]], physeq_list_B[[12]], 
                                 physeq_list_B[[13]], physeq_list_B[[14]],
-                                physeq_list_B[[15]])
+                                physeq_list_B[[15]], physeq_list_B[[16]], 
+                                physeq_list_B[[17]], physeq_list_B[[18]])
 
 # quick check
 View(as(otu_table(merged_physeq_B), "matrix"))
 View(as(sample_data(merged_physeq_B), "data.frame"))
 
 # save
-saveRDS(merged_physeq_B, file = "olive_FMBN_5_1_B_phy.rds")
+saveRDS(merged_physeq_B, file = "olive_FMBN_5_1_2_B_phy.rds")
 sample_data <- as(sample_data(merged_physeq_B), "data.frame")
-write_tsv(sample_data, file = "olive_FMBN_5_1_B_sample_data.txt")
+write_tsv(sample_data, file = "olive_FMBN_5_1_2_B_sample_data.txt")
 
 # fungi
 # I need to remove all the studies which have a suffix like sample, environment
@@ -367,20 +368,94 @@ merged_physeq_F <- merge_phyloseq(physeq_list_F[[1]], physeq_list_F[[2]],
                                   physeq_list_F[[3]], physeq_list_F[[4]], 
                                   physeq_list_F[[5]], physeq_list_F[[6]], 
                                   physeq_list_F[[7]], physeq_list_F[[8]],
-                                  physeq_list_F[[9]])
+                                  physeq_list_F[[9]], physeq_list_F[[10]],
+                                  physeq_list_F[[11]], physeq_list_F[[12]])
 
 # quick check
 View(as(otu_table(merged_physeq_F), "matrix"))
 View(as(sample_data(merged_physeq_F), "data.frame"))
 
 # save
-saveRDS(merged_physeq_F, file = "olive_FMBN_5_1_F_phy.rds")
+saveRDS(merged_physeq_F, file = "olive_FMBN_5_1_2_F_phy.rds")
 sample_data <- as(sample_data(merged_physeq_F), "data.frame")
-write_tsv(sample_data, file = "olive_FMBN_5_1_F_sample_data.txt")
+write_tsv(sample_data, file = "olive_FMBN_5_1_2_F_sample_data.txt")
+
+# add the extra metadata to bacteria
+# read the extra data
+# get extra metadata 
+extra_metadata_B <- read_tsv(file.path("data", "extra_metadata_B.txt"))
+# check for duplicates
+if(any(duplicated(extra_metadata_B$sampleId))){
+  dupli_extra_B <- which(duplicated(extra_metadata_B$sampleId)) 
+  extra_metadata_B_no_dupli <- extra_metadata_B[-dupli_extra_B,]
+  # save as a .txt file
+  write_tsv(extra_metadata_B_no_dupli,
+            file.path("data", "extra_metadata_B_no_dupli.txt")) 
+  }
+
+sample_data_B <- as(sample_data(merged_physeq_B), "data.frame")
+
+# join the metadata, plus add a few other grouping or labeling variables
+sample_data_B_extra <- sample_data_B |> 
+  rownames_to_column("SRA_run") |>
+  rename(spoil_ferm = spoilage)
+# add further variables from metadata
+sample_data_B_extra <- left_join(sample_data_B_extra,
+                                 select(extra_metadata_B, sampleId, descr = description, DOI,
+                                        olive_cultivar:ripe_trade) 
+) |>
+  mutate(coln = SRA_run) |>
+  column_to_rownames(var = "coln")
+
+
+merged_physeq_B_extra <- merged_physeq_B
+sample_data(merged_physeq_B_extra) <- sample_data_B_extra
+
+# any further operation will be performed on a copy
+
+saveRDS(merged_physeq_B_extra, file.path("data", "olive_FMBN_5_1_2_B_extra_phy.rds"))
+
+# same for fungi
+
+# read the extra data
+# get extra metadata 
+extra_metadata_F <- read_tsv(file.path("data", "extra_metadata_F.txt"))
+# check for duplicates
+any(duplicated(extra_metadata_F$sampleId)) # TRUE
+dupli_extra_F <- which(duplicated(extra_metadata_F$sampleId)) 
+extra_metadata_F_no_dupli <- extra_metadata_F[-dupli_extra_F,]
+# save as a .txt file
+write_tsv(extra_metadata_F_no_dupli,
+          file.path("data", "extra_metadata_F_no_dupli.txt")) 
+
+sample_data_F <- as(sample_data(merged_physeq_F), "data.frame")
+
+# join the metadata, plus add a few other grouping or labeling variables
+sample_data_F_extra <- sample_data_F |> 
+  rownames_to_column("SRA_run") |>
+  rename(spoil_ferm = spoilage)
+# add further variables from metadata
+sample_data_F_extra <- left_join(sample_data_F_extra,
+                                 select(extra_metadata_F, sampleId, descr = description, DOI,
+                                        olive_cultivar:ripe_trade),
+                                 multiple = "first"
+                                 
+) |>
+  mutate(coln = SRA_run) |>
+  column_to_rownames(var = "coln")
+
+
+merged_physeq_F_extra <- merged_physeq_F
+sample_data(merged_physeq_F_extra) <- sample_data_F_extra
+
+# any further operation will be performed on a copy
+
+saveRDS(merged_physeq_F_extra, file.path("data", "olive_FMBN_5_1_2_F_extra_phy.rds"))
+
 
 
 # Session report ----------------------------------------------------------
-# This script has been tested with R 4.3.3 or R 4.4.0, x86 build, on a MacBook Pro
+# This script has been tested with R 4.3.3 or R 4.4.0 or R4.5.1, x86 build, on a MacBook Pro
 # 14 inch, 2023, with chip Apple M3 Pro and 16 GB RAM and on a MacStudio 2023
 # with Apple M2 Max chip, both running MacOs Sonoma 14.5
 sessionInfo()
@@ -389,7 +464,7 @@ sessionInfo()
 # Copyright notice --------------------------------------------------------
 
 # Script created by Eugenio Parente (eugenio.parente@unibas.it), 
-# Università degli Studi della Basilicata, 2023, 2024, 2025 https://github.com/ep142
+# Università degli Studi della Basilicata, 2023, 2024, 2025, 2026 https://github.com/ep142
 # Permission is hereby granted, free of charge, to any person obtaining a copy 
 # of this software and associated documentation files (the \"Software\"), to 
 # deal in the Software without restriction, including without limitation the 
