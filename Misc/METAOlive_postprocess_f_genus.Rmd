@@ -1,0 +1,1124 @@
+---
+title: "Microbial Association Networks in table olives: fungi, genus level"
+subtitle: "Post-inference statistical and graphical analysis"
+author: "E. Parente, Scuola SAFE, Università degli Studi della Basilicata"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    df_print: paged
+---
+
+v0.1.2 8/11/24
+
+# Things to do.  
+
+Check which packages are really needed and remove the others.  
+  
+I need to find a way to handle parent-child relationships.
+
+Must improve the analysis of the graphical presentation of the network of networks.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+.bioc_packages <- c("BiocManager", "phyloseq")
+.cran_packages <- c("tidyverse", "tictoc", "beepr", "logr", "VennDiagram", 
+                    "lobstr", "parallel", "tidygraph", "ggraph", "cowplot",
+                    "RColorBrewer", "knitr", "kableExtra", "gmodels", "readxl",
+                    "GGally", "ggrepel")
+
+.inst <- .bioc_packages %in% installed.packages()
+if(any(!.inst)) {
+  if(!.inst[1]) {
+    install.packages("BiocManager")
+    .inst <- .bioc_packages %in% installed.packages()
+  }
+  if(any(!.inst[2:length(.inst)])) {
+    BiocManager::install(.bioc_packages[!.inst], ask = F)
+  }
+}
+
+.inst <- .cran_packages %in% installed.packages()
+if(any(!.inst)) {
+  install.packages(.cran_packages[!.inst])
+}
+
+# lobstr is installed for obj_size
+# cowplot for arranging plots created by ggplot in grids
+# RColorBrewer to create the palette for phyla
+
+
+# Load packages into session, and print package version
+sapply(c(.cran_packages, .bioc_packages), require, character.only = TRUE)
+
+
+# the following command detects the number of cores on UNIX/MacOS
+ncores <- parallel::detectCores(logical = F) # to detect physical cores in MacOS
+# other setup operations
+opar <- par(no.readonly=TRUE) 
+par(ask=F) 
+# set.seed(1234) 
+# play audio notifications
+play_audio <- T
+# time important steps
+keep_time <- T
+# verbose output: will print additional objects and messages
+verbose_output <- T
+
+# output folder
+output_folder <- file.path("out_metaanalysis", "fungi")
+# a prefix for file names
+out_filename_pref <- "METAolive_F_genus_"
+
+# open study metadata
+study_info <- read_tsv("whole_studies_info.txt")
+
+# get functions
+source(file.path("source", "net_anal_funct_v1_1.R"))
+# the color scheme for edges
+edge_col_scheme <- c(copres = "cyan", mut_ex = "magenta")
+
+
+# where are my files
+# get the list of the yeast genera
+yeast_genera <- read_xlsx("yeast_genera_species.xlsx")
+
+# where are my input data?
+
+data_path <- file.path("output", "MAN_F")
+
+all_files <- list.files(data_path)
+# open study metadata
+study_info <- read_tsv("whole_studies_info.txt")
+```
+
+# About this document.  
+
+This document illustrates graphical and statistical analysis on microbial association networks inferred with 3 different methods on `r nrow(study_info)` studies on fungal microbiota on table olives and related environments extracted from [FoodMicrobionet](http://web.unibas.it/parente/?page_id=761). This is part of the PRIN 2022 Project METAOlive. All scripts will be published (eventually) in my [GitHub repository](https://github.com/ep142/Metaolive).  
+
+
+# Stage 1. Compare global network properties.  
+
+Network inference, calculation of statistics on networks, nodes and edges, conversion of networks to tidygraphs and creation of plots was performed with an ad hoc pipeline modelled after [a previous one](https://github.com/ep142/MAN_in_cheese) with several modifications. 
+Functions in package [NetCoMi](https://github.com/stefpeschel/NetCoMi) were adapted and expanded.  
+
+If you want to adapt this script for your own purposes please adapt the setup chunk and input/output file location.
+
+The data generated from phyloseq objects extracted from FoodMicrobionet are all included in the project folder.  
+First, I will load and display the metadata.  
+
+```{r load_metadata}
+
+
+# only keep relevant variables, and process the study_type variable
+study_info_2 <- study_info |> 
+  dplyr::select(studyId, target, region, platform, samples, short_descr, ref_short, study_type) |>
+  separate_wider_delim(study_type, delim = " ", 
+                       names = c("st_design", "st_arrang"), 
+                       too_few = "align_start", too_many= "drop") |>
+  mutate(st_design = str_remove(st_design, ","))
+
+study_info_2
+```
+
+The studies have different designs, targets etc. Designs are defined as follows:  
+
+* cross-sectional: a single time-point available for each treatment/group; the objective of the study is mostly to compare different samples / sample groups  
+
+* longitudinal: at least 5 time points are available for each sample  
+
+* mixed: some sort of intermediate between the two  
+
+The study type is followed by two numbers in the format mxn where m is the number of treatments/sample types and n the number of time points.  
+
+A summary table for the different types of studies follows.  
+
+
+```{r summary_metadata, echo=FALSE}
+# a quick check
+
+study_info_2 |> dplyr::count(st_design)
+
+write_tsv(study_info_2, file.path(output_folder, "METAolive_studies_compact.txt"))
+```
+
+The majority of the studies are cross-sectional.  
+
+
+```{r load_study_data, message=FALSE}
+
+# get the files with the inference reports
+inf_reports <- all_files[str_detect(all_files,"inf_rep")]
+inf_reports_paths <- file.path(data_path, inf_reports)
+# combine in a data frame
+inf_rep_list <- map(inf_reports_paths, read_tsv)
+inf_rep_df <- list_rbind(inf_rep_list)
+# a wee bit of wrangling
+inf_rep_df <- inf_rep_df |>
+  separate_wider_delim(cols = "dataset", names = c("studyId", "NA_target"), 
+                       delim = "_", cols_remove = F) |>
+  left_join(study_info_2)
+
+# get the report on network stats
+tg_reports <- list.files(data_path)
+tg_reports <- file.path(data_path,tg_reports[str_detect(tg_reports,"tidygraphreport")])
+tg_rep_list <- map(tg_reports, read_tsv)
+tg_rep_df <- list_rbind(tg_rep_list)
+tg_rep_df <- tg_rep_df |>
+  separate_wider_delim(cols = "dataset", names = c("studyId", "NA_target"), 
+                       delim = "_", cols_remove = F) |>
+  left_join(study_info_2)
+
+# get the files with the global network properties
+gl_net_prop_all <- all_files[str_detect(all_files,"netpropall")]
+gl_net_prop_all_paths <- file.path(data_path, gl_net_prop_all)
+gl_net_prop_all_list <- map(gl_net_prop_all_paths, read_tsv)
+gl_net_prop_all_df <- list_rbind(gl_net_prop_all_list)
+# need to drop a few columns
+gl_net_prop_all_df <- dplyr::select(gl_net_prop_all_df, dataset:nnegedge)
+
+# get the files with the LCC network properties
+gl_net_prop_lcc <- all_files[str_detect(all_files,"netproplcc")]
+gl_net_prop_lcc_paths <- file.path(data_path, gl_net_prop_lcc)
+gl_net_prop_lcc_list <- map(gl_net_prop_lcc_paths, read_tsv)
+gl_net_prop_lcc_df <- list_rbind(gl_net_prop_lcc_list)
+# need to drop a few columns
+gl_net_prop_lcc_df <- dplyr::select(gl_net_prop_lcc_df, dataset:nnegedge)
+
+# get the files with diversiy prefilter
+div_pref_files <- all_files[str_detect(all_files,"divprefilter")]
+div_pref_files_paths <- file.path(data_path, div_pref_files)
+# need to handle this in a loop
+for(i in seq_along(div_pref_files_paths)){
+  load(file = div_pref_files_paths[[i]])
+  if(i == 1){
+    dd <- div_est_prefilter
+  } else {
+    dd <- bind_rows(dd, div_est_prefilter)
+  }
+}
+div_est_prefilter <- dd 
+div_est_prefilter <- div_est_prefilter |>
+  separate_wider_delim(cols = "dataset", names = c("studyId", "NA_target"), 
+                       delim = "_", cols_remove = F)
+rm(dd, i)
+```
+
+## Is there a relationship between study type and ability to return a network?    
+
+Microbial association network inference was performed (after permutation filtering with [PERFect](https://bioconductor.org/packages/release/bioc/html/PERFect.html)) with package [NetCoMi](https://github.com/stefpeschel/NetCoMi) using 3 methods:  
+
+* SparCC
+
+* CCREPE
+
+* SpiecEasi  
+
+The use of SPRING was discontinued because this algorithm requires a prohibiteve amount of time, Not all combinations of dataset and method returned networks and some returned very sparse networks or a network with no edges. A simple table reporting the instances in which network inference returned a result is shown below:
+
+```{r inference_report}
+successes <- inf_rep_df |>
+  dplyr::select(dataset, inf_method, obj_class, st_design) |>
+  mutate(MAN_inference = if_else(obj_class == "microNet", "success", "fail")) |>
+  dplyr::select(-obj_class) |>
+  pivot_wider(id_cols = c(dataset, st_design), names_from = inf_method,
+              values_from = MAN_inference)
+inf_rep_df |> 
+  dplyr::select(dataset, inf_method, obj_class, st_design) |>
+  mutate(MAN_inference = if_else(obj_class == "microNet", "success", "fail")) |>
+  dplyr::select(-obj_class) |>
+  group_by(st_design, inf_method, MAN_inference) |>
+  summarise(n = n()) |>
+  pivot_wider(id_cols = c(st_design, inf_method),
+              names_from = MAN_inference, values_from = n, values_fill = 0) 
+
+```
+
+Apparently, CCREPE frequently failed to return a network. Let's try a more formal cross tabulation:  
+
+```{r success_xtab}
+inf_rep_df_2 <- inf_rep_df |>
+  dplyr::filter(obj_class == "microNet")
+gmodels::CrossTable(inf_rep_df_2$st_design,inf_rep_df_2$inf_method,
+                    chisq = T)
+# ccrepe only
+inf_rep_df_3 <- inf_rep_df |>
+  dplyr::filter(inf_method == "ccrepe") |>
+  mutate(MAN_inf = if_else(obj_class == "microNet", "success", "fail"))
+gmodels::CrossTable(inf_rep_df_3$st_design,inf_rep_df_3$MAN_inf,
+                    chisq = T, fisher = T)
+```
+No evidence of different frequencies in success for different designswhen all methods are used. Significant effect for CCREPE only.   
+The number of networks which could be transformed in tidygraphs was the same.  
+
+```{r tidygraphreport}
+successes_tg <- tg_rep_df |>
+  dplyr::select(dataset, inf_method = method, obj_returned, st_design) |>
+  mutate(tg_return = if_else(obj_returned == "tbl_graph", "success", "fail")) |>
+  dplyr::select(-obj_returned) |>
+  pivot_wider(id_cols = c(dataset, st_design), names_from = inf_method,
+              values_from = tg_return)
+tg_rep_df |> 
+  dplyr::select(dataset, inf_method = method, obj_returned, st_design) |>
+  mutate(tg_return = if_else(obj_returned == "tbl_graph", "success", "fail")) |>
+  dplyr::select(-obj_returned) |>
+  group_by(st_design, inf_method, tg_return) |>
+  summarise(n = n()) |>
+  pivot_wider(id_cols = c(st_design, inf_method),
+              names_from = tg_return, values_from = n, values_fill = 0) 
+```
+
+Let's create a crosstabulation (although the results will be identical with those on inference of networks).
+
+```{r tgrepcrosstabb}
+tg_rep_df_2 <- tg_rep_df |>
+  dplyr::filter(obj_returned == "tbl_graph")
+gmodels::CrossTable(tg_rep_df_2$st_design,tg_rep_df_2$method,
+                    chisq = T)
+```
+Again, no evidence that there is a significant difference in the success in returning a network due to the study design.  
+
+
+## Difference in properties of the networks obtained with different inference methods.  
+
+The NetCoMi netAnalyze() function allows the calculation of global network properties for both the complete network and the Large Connected Component (the latter should be better for some indices). I will now compare some important network properties.
+
+
+### Network size vs. study type and method.  
+
+First of all, let's create a table for the networks whose properties were analyzed. I will first join information from the metadata.  
+
+```{r netanalysisall_1}
+
+gl_net_prop_all_df_2 <- gl_net_prop_all_df |>
+  separate_wider_delim(dataset, delim = "_", names = c("studyId", "target_1"),
+                       cols_remove = F) |>
+  left_join(study_info_2) |>
+  arrange(studyId, dataset, method)
+gl_net_prop_lcc_df_2 <- gl_net_prop_lcc_df |>
+  separate_wider_delim(dataset, delim = "_", names = c("studyId", "target_1"),
+                       cols_remove = F) |>
+  left_join(study_info_2)|>
+  arrange(studyId, dataset, method)
+
+gmodels::CrossTable(gl_net_prop_all_df_2$st_design,gl_net_prop_all_df_2$method,
+                    chisq = T)
+
+```
+
+
+Same with Large Connected Component.
+
+```{r lccnetanalyzetable, echo = F}
+gmodels::CrossTable(gl_net_prop_lcc_df_2$st_design,gl_net_prop_lcc_df_2$method,
+                    chisq = T)
+```
+First, how fragmented are networks? How large?
+
+```{r netsize_all, dpi = 150}
+gl_net_prop_all_df_2 |> 
+  ggplot(mapping = aes(x = method, y = log2(nnodes))) +
+  facet_wrap(~st_design) +
+  geom_boxplot(notch = T) +
+  geom_jitter(mapping = aes(color = target_1)) +
+  labs(y = "log2(nodes)", x = "inf. method", color = "target") +
+  scale_y_continuous(breaks = seq(0,10,2)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+gl_net_prop_all_df_2 |> 
+  ggplot(mapping = aes(x = method, y = log2(nnodes))) +
+  geom_boxplot(notch = T) +
+  geom_jitter(mapping = aes(color = target_1, shape = st_design)) +
+  labs(y = "log2(nodes)", x = "inf. method", 
+       color = "target", st_design = "design") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+No difference
+
+Perhaps a different visualization (fraction of taxa which appear in modes) is better.
+
+```{r nodeprop, dpi = 150}
+gl_net_prop_all_df_2 |> 
+  mutate(frac_nodes = nnodes/ntaxa) |>
+  ggplot(mapping = aes(x = method, y = frac_nodes)) +
+  facet_wrap(~st_design) +
+  geom_boxplot(notch = T) +
+  geom_jitter(mapping = aes(color = target_1)) +
+  labs(y = "fraction of taxa in the network", x = "inf. method", color = "target") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+I am afraid it is hard to draw any conclusion given the low number of studies for each type.  
+The two studies with high number of nodes for SPIEC-EASI were both longitudinal.  
+
+Let's try a non parametric test.
+
+```{r test fracnodes}
+gl_net_prop_all_df_2 <- gl_net_prop_all_df_2 |> 
+  mutate(frac_nodes = nnodes/ntaxa)
+attach(gl_net_prop_all_df_2)
+method <- factor(method)
+pairwise.wilcox.test(frac_nodes, method)
+detach(gl_net_prop_all_df_2)
+```
+
+There are no significant differences.  
+
+### The number of components and the density.  
+
+Let's check number of components and density.  
+
+```{r nc_density, dpi = 150}
+gl_net_prop_all_df_2 |> 
+  ggplot(mapping = aes(x = method, y = log2(nComp1))) +
+  facet_wrap(~st_design) +
+  geom_boxplot(notch = T) +
+  geom_jitter(mapping = aes(color = target_1)) +
+  labs(y = "log2(number of components)", x = "inf. method", color = "target") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+gl_net_prop_all_df_2 |> 
+  ggplot(mapping = aes(x = method, y = density1)) +
+  facet_wrap(~st_design) +
+  geom_boxplot(notch = T) +
+  geom_jitter(mapping = aes(color = target_1)) +
+  labs(y = "network density", x = "inf. method", color = "target") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Again the data are too sparse for any conclusion but one mixed study has high density.  
+
+```{r density_spieceasi, dpi = 150}
+gl_net_prop_all_df_2 |> 
+  dplyr::filter(method == "spieceasi") |>
+  ggplot(mapping = aes(x = st_design, y = density1)) +
+  geom_boxplot(notch = T) +
+  geom_jitter(mapping = aes(color = target_1)) +
+  labs(y = "network density", x = "study design", color = "target") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# check if differences are significant wihin spieceasi
+gl_net_prop_all_df_se <- gl_net_prop_all_df_2 |>
+  dplyr::filter(method == "spieceasi") |>
+  mutate(st_design = factor(st_design))
+pairwise.wilcox.test(x = gl_net_prop_all_df_se$density1, g = gl_net_prop_all_df_se$st_design)
+
+
+pairwise.wilcox.test(x = gl_net_prop_all_df_2$density1, g = gl_net_prop_all_df_2$method)
+
+```
+The boxplot is for SPIEC-EASI only. Again one study with high density.
+
+### Positive edge proportion.  
+
+The Positive Edge Proportion (as %) is also an interesting statistics for networks. It is supposed to go down in "diseased" networks compared to healthy, but it might really be function of the study rather than other factors. no harm in having a look.  
+
+```{r PEP}
+gl_net_prop_all_df_2 |> 
+  ggplot(mapping = aes(x = method, y = pep1)) +
+  facet_wrap(~st_design) +
+  geom_boxplot(notch = T) +
+  geom_jitter(mapping = aes(color = target_1)) +
+  labs(y = "PEP", x = "inf. method", color = "target") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+PEP very high for cross-sectional and longitudinal studies. 
+
+### The large connected components.  
+
+The networks are more or less fragmented and some statistics only have sense in the large connected component.  
+First, let's examine the relative size of the LCC.  
+
+```{r LCC_rel_size}
+gl_net_prop_lcc_df_2 |> 
+  ggplot(mapping = aes(x = method, y = lccSizeRel1)) +
+  facet_wrap(~st_design) +
+  geom_boxplot(notch = T) +
+  geom_jitter(mapping = aes(color = target_1)) +
+  labs(y = "LCC, rel. size", x = "inf. method", color = "target") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+pairwise.wilcox.test(x = gl_net_prop_lcc_df_2$lccSizeRel1, g = gl_net_prop_lcc_df_2$method)
+```
+
+LCC relative size is variable with no special pattern detectable by method and study design.   
+
+```{r LCC_clust, dpi = 150}
+gl_net_prop_lcc_df_2 |> 
+  ggplot(mapping = aes(x = method, y = clustCoef1)) +
+  facet_wrap(~st_design) +
+  geom_boxplot(notch = T) +
+  geom_jitter(mapping = aes(color = target_1)) +
+  labs(y = "LCC, clustering coefficient", x = "inf. method", color = "target") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+pairwise.wilcox.test(x = gl_net_prop_lcc_df_2$clustCoef1, g = gl_net_prop_lcc_df_2$method)
+```
+SPIEC-EASI has by far the lowest clustering coefficient. This is consistently found in other environments.  
+
+```{r LCC_avepath, dpi = 150}
+gl_net_prop_lcc_df_2 |> 
+  ggplot(mapping = aes(x = method, y = avPath1)) +
+  facet_wrap(~st_design) +
+  geom_boxplot(notch = T) +
+  geom_jitter(mapping = aes(color = target_1)) +
+  labs(y = "LCC, average path length", x = "inf. method", color = "target") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+pairwise.wilcox.test(x = gl_net_prop_lcc_df_2$avPath1, g = gl_net_prop_lcc_df_2$method)
+```
+
+
+As a consequence, average path length is higher for SPIEC-EASI.  
+
+ 
+
+## Relationships between study characteristics and network structure.  
+
+Another hypothesis that can be tested, to avoid the fact that in the previous graphs all conclusions are confounded by some characteristics of the study (size in terms of samples, diversity, evenness) is that there is some sort of internal relationships among this properties. this can be tested in both bivariate plots and with PCA.  
+
+
+```{r compare_global, dpi = 96}
+if(keep_time) tic("Comparing global properties")
+# create a label and extract matrix for the analysis
+global_all_df_2 <- gl_net_prop_all_df_2 %>%
+  mutate(method_brief = case_when(
+    method == "spieceasi" ~ "spi",
+    method == "spring" ~ "spr",
+    method == "ccrepe" ~ "ccr",
+    method == "sparcc" ~ "spa"
+  )) %>%
+  tidyr::unite(label, dataset, method_brief, sep = "_", remove = F)
+# add diversity estimates
+# clean up
+div_est_prefilter_2 <- div_est_prefilter |>
+  mutate(dataset = str_remove_all(dataset, "\\.rds"))
+global_all_df_2 <- left_join(
+  global_all_df_2,
+  select(div_est_prefilter_2, dataset, Observed:ave_BC)
+)  
+
+# keep only relevant columns and make a matrix
+global_all_df_mat <- global_all_df_2 %>% 
+  dplyr::select(label, nComp1:nnegedge, samples, Chao1, Pielou_J, ave_BC) %>%
+  column_to_rownames("label") %>% as.matrix()
+
+# optionally obtain a scatterplot matrix
+if(verbose_output) ggpairs(as.data.frame(global_all_df_mat), progress = F)
+
+
+# look at the number of components (using correlation matrix)
+var_to_use <- !(colnames(global_all_df_mat) %in% c("ncomp", "vertConnect1","edgeConnect1","ntaxa"))
+
+# as an alternative I should try PCAtools from bioconductor
+psych::fa.parallel(global_all_df_mat[,c(1:5,8:14,17:18)], fa = "pc", n.iter = 100)
+
+PCA1 <- psych::principal(global_all_df_mat[,c(1:5,8:14,17:18)], nfactors = 4, rotate = "varimax")
+PCA1
+biplot(PCA1, main = "PCA biplot, all variables")
+fullnetscores <- cbind(global_all_df_2,PCA1$scores)
+# the score plot
+ggplot(fullnetscores, mapping = aes(x = RC1, y = RC2, shape = method)) +
+  geom_point() +
+  labs(title = "all variables") +
+  scale_shape_manual(values = c("spieceasi" = 16, "spring" = 17, "ccrepe" = 15, "sparcc" = 18)) +
+  scale_color_brewer(type = "qual", palette = "Paired") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+var_to_use <- colnames(global_all_df_mat) %in% c("ncomp1", "modularity1","density1","clustCoef1",
+                                                 "avPath1", "pep1", "Pielou_J", "ave_BC", "nnodes")
+cat("variables to use: ", var_to_use, "\n")
+
+psych::fa.parallel(global_all_df_mat[,var_to_use], fa = "pc", n.iter = 100)
+
+PCA2 <- psych::principal(global_all_df_mat[,var_to_use], nfactors = 2, rotate = "varimax")
+PCA2
+biplot(PCA2)
+fullnetscores_2 <- cbind(global_all_df_2,PCA2$scores)
+var_acc_RC1 <- round(PCA2$Vaccounted[4,1],3)
+var_acc_RC2 <- round(PCA2$Vaccounted[4,2],3)
+# the score plot
+ggplot(fullnetscores_2, mapping = aes(x = RC1, y = RC2, shape = method)) +
+  geom_point() +
+  labs(title = "selected variables") +
+  scale_shape_manual(values = c("spieceasi" = 16, "spring" = 17, "ccrepe" = 15, "sparcc" = 18)) +
+  scale_color_brewer(type = "qual", palette = "Paired") +
+  labs(x = paste("RC1 (", var_acc_RC1, ")", sep =""),
+       x = paste("RC2 (", var_acc_RC2, ")", sep ="")) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# spieceasi only
+fullnetscores_2 |>
+  dplyr::filter(method == "spieceasi") |>
+ggplot(mapping = aes(x = RC1, y = RC2, shape = st_design)) +
+  geom_point() +
+  labs(title = "selected variables") +
+  scale_color_brewer(type = "qual", palette = "Paired") +
+  labs(x = paste("RC1 (", var_acc_RC1, ")", sep =""),
+       x = paste("RC2 (", var_acc_RC2, ")", sep ="")) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+fname <- str_c("spieceasi_PCA_global_all.tiff")
+ggsave(filename = file.path(output_folder, fname), device = "tiff", width = 6, 
+       height = 5, units = "in", dpi=600)
+
+if(keep_time) toc()
+```
+Not much of a pattern with any combination, except may be the relationships among the loadings, which are pretty obvious.  
+Given the results there is no point in trying with another method for PCA (like PCAtools).  
+It is conceivable that with more data patterns may emerge.  
+
+# Plotting selected networks.  
+
+I will first load the tidygrah list and then plot selected networks.  
+The networks are selected on the basis of their aspect. Some are more like hairballs, with little interpretable structure. Other clearly show patterns and clusters.  
+
+```{r load_tglists}
+all_files_2 <- list.files(data_path)
+
+tglist_fnames <- all_files_2[str_detect(all_files_2, "tdglist")]
+tglist_paths <- file.path(data_path, tglist_fnames)
+tglist <- list()
+for(i in seq_along(tglist_paths)){
+  load(tglist_paths[i])
+  if(i==1){
+    tglist <- netplot_list
+  } else {
+    tglist <- c(tglist,netplot_list)
+  }
+}
+rm(netplot_list)
+
+```
+Here the level of taxonomic aggregation is species while nodes are named after genera (there is little point in doing otherwise but, in principle, I could automate abbreviations).  
+Note that I am not optimizing appearance, but, in theory width and heigth could be controlled. This is certainly true when saving the graphs.
+
+```{r ST182se}
+print(tglist$ST182$spieceasi)
+```
+
+
+ST182 is a small study on Aloreña olives. Only two nodes are found. 
+
+```{r ST239se}
+print(tglist$ST239$spieceasi)
+```
+ST239 is the largest study we have (Penland et al., 2020), and it is also a longitudinal study. PEP is quite high and the network includes many molds which are not quantitatively important but possibly reflect background contamination of the olives.  
+
+
+```{r ST47se}
+print(tglist$ST247$spieceasi)
+```
+
+ST247 is a source tracking study on Nyons olives, with data from many different environments and with spoiled samples. The network is disconnected but many interactions are found in other networks as well.  
+
+In conclusion, plotting of the networks alone is not especially interesting. Node and edge analysis might be much more promising.  
+
+# Stage 2. Node analysis.  
+
+Following network inference a few statistics are collected on nodes and this might be interesting to identify hubs (usually high values of centrality indices, like degree or eigenvector centrality) and bottlenecks (usually nodes with high betweeness centrality, whose removal from the network results in network disruption). Both are considered types of keystone nodes which, supposedly, are important in a given network/environment.  
+I will be running the analysis for two methods, SparCC and SPIEC-EASI.  
+
+```{r nodestats_file, warning = F, message = F}
+# load the node stats
+node_stats_df_fns <- file.path(data_path, all_files[str_detect(all_files, "nodestats")])
+node_stats_df <- map(node_stats_df_fns, read_tsv) |>
+  list_rbind(names_to = "iteration")
+
+# identify nodes which are also yeasts
+node_stats_df_2 <- node_stats_df |>
+  mutate(is_yeast = genus %in% yeast_genera$`Species name`)
+node_stats_df_yeast <- node_stats_df_2 |>
+  dplyr::filter(is_yeast)
+```
+
+Let's plot node plots for yeast only. As an alternative, I could consider using relative abundance for alpha and betweenness for size
+
+```{r node_analysis_hub_freq, dpi = 96, warning = F}
+if(keep_time) tic("Node analysis")
+
+mymethods <- c("spieceasi","sparcc")
+n_to_label <- 20 # max number of nodes to label in the node plots
+node_analysis_list <- vector("list", length = length(mymethods))
+for(i in seq_along(mymethods)){
+  # create the dfs, one for spieceasi and one for sparCC
+  # only select nodes with degree>0
+  node_df <- node_stats_df_yeast %>%
+    dplyr::filter(method == mymethods[i]) %>%
+    dplyr::filter(degree>0) %>%
+    mutate(Study = as.factor(Study),
+           rel_pos_degree = pos_degree / sum(pos_degree)) %>%
+    dplyr::rename(tlabel = label)
+  if(nrow(node_df)==0) next # it will almost certainly have at lest one network
+  # use a loop to do the node degree graphs, print them and put them in a list
+  node_degree_plot_list <- vector("list", length=nlevels(node_df$study))
+  
+  for(j in seq_along(levels(node_df$Study))){
+    gtitle = paste(levels(node_df$Study)[j], mymethods[i], sep = ", ")
+    temp_df <- node_df %>% 
+      dplyr::filter(Study ==levels(node_df$Study)[j]) %>%
+      mutate(dgr = pos_degree + neg_degree) %>%
+      arrange(-dgr) %>%
+      rowid_to_column() %>% 
+      mutate(to_label = if_else((rowid<=20 | is_hub), tlabel, NA_character_))
+    
+    ave_degree = mean(temp_df$dgr, na.rm = T)
+    ave_pos_degree = mean(temp_df$pos_degree, na.rm = T)
+    # creating the plot, only the names of the top 20 nodes (in terms of degree)
+    # are plotted, hubs are always plotted
+    ggp <- ggplot(
+      temp_df,
+      mapping = aes(
+        x = pos_degree,
+        y = dgr,
+        label = str_trunc(genus, 16, side = "center", ellipsis = "_")
+      )
+    ) +
+      geom_smooth(method = "lm", linetype = 3, se = F, color = I("black"), show.legend = F) +
+      geom_point(mapping = aes(color = phylum,
+                               size = between,
+                               alpha = relAbundance)) +
+      geom_text_repel(show.legend = F, max.overlaps = 20, alpha = I(0.5)) +
+      geom_abline(slope = 1, intercept = 0, linetype = 1) +
+      geom_hline(yintercept = ave_degree, linetype = 3, show.legend = F) +
+      geom_vline(xintercept = ave_pos_degree, linetype = 3, show.legend = F) +
+      scale_alpha_continuous(range = c(0.4, 1)) +
+      scale_size_continuous(range = c(1,6)) +
+      labs(
+        x = "positive degree",
+        y = "degree",
+        size = "relative abundance",
+        alpha = "betweenness",
+        title = gtitle
+      ) +
+      theme_bw() +
+      theme(plot.title = element_text(hjust = 0.5))
+    
+    print(ggp)
+    node_degree_plot_list[[j]] <- ggp
+    names(node_degree_plot_list[[j]]) <- gtitle
+  }
+  file_name <- paste(file.path(output_folder,out_filename_pref), "_", mymethods[i], "_nodeplots.Rdata",sep="")
+  save(node_degree_plot_list, file = file_name)
+  
+  # calculate frequency for hubs (meaningful only if you have many taxa and the percentile for hub detection is low, say 0.75-0.90)
+  n_datasets <- dplyr::n_distinct(node_df$dataset)
+  node_df_hubs <- node_df %>%
+    dplyr::filter(is_hub == T) %>%
+    group_by(tlabel, phylum, class) %>%
+    summarise(hub_freq = n()/n_datasets) %>%
+    arrange(-hub_freq)
+  cat("method", mymethods[i], "hub frequency", "\n")
+  head(node_df_hubs, 20)
+  # save elements in the list
+node_analysis_list[[i]] <- list(
+  node_df = node_df,
+  plot_list = node_degree_plot_list,
+  node_df_hubs = node_df_hubs
+)
+names(node_analysis_list)[i]<- mymethods[i]
+  
+}
+saveRDS(node_analysis_list, str_c(file.path(output_folder, out_filename_pref),"node_an_list.rds"))
+if(play_audio) beep(sound = 6)
+if(keep_time) toc()
+rm(node_df, node_degree_plot_list, temp_df, node_df_hubs)
+```
+
+The node plots provide a number of visual cues:
+
+* the horizontal and vertical dotted lines show the average value for degree and positive degree and may help in identifying nodes whose values are far from the mean;  
+
+* the diagonal continuous line corresponds to points for which positive degree and degree are equal; points above the line have at least 1 negative interaction
+
+* the diagonal dotted line is the linear regression line for degree as a function of positive degree; its position and slope relative to the previous line indicates on average how much the ratio between total degree and positive degree changes as a function of degree; data points which are far from this line also have an unusual ratio between the two values compared to the other nodes in the same dataset.  
+
+* negative hubs will be located close to the upper left corner; positive hubs will be closer to the right of the plot.  
+
+Even with SPIEC-EASI the number of plotted nodes is high for some studies (but very low for others), and one may consider plotting a given number of nodes (the ones with top degree? top eigenvector centrality?, some combination of both) to simplify the plot.  
+Said that, although betweenness centrality may be interesting to identify "bottleneck" taxa, looking at betweenness is difficult (the shades of alpha = transparency are visually difficult to separate), but otherwise degree, positive degree and abundance are all easy to visualize.  
+Another interesting way to identify keystones, across studies, is the frequency with which a given taxon is detected as a hub by NetCoMi.
+
+```{r is_hub}
+kable(node_analysis_list$spieceasi$node_df_hubs, caption = "Hubs, yeast genera, SPIEC-EASI") |>
+  kable_classic()
+
+kable(node_analysis_list$sparcc$node_df_hubs, caption = "Hubs, yeast genera, SparCC") |>
+  kable_classic()
+```
+
+Note that the number of stable hubs detected by SparCC is higher and several of them are genera which are known to be important in olive microbiota. Others definitely are not and it would be interesting to explore further their role.. If one was interested in comparing methods, a Venn plot could be a way of detecting hubs which are stable cross studies and methods.  
+
+# Stage 3. Edge analysis.  
+
+Edge analysis only makes sense once one has settled for meaningful questions and selected a large and diverse enough set of studies.
+Questions which might be relevant:
+
+* how stable is an edge?
+
+  + within a study across methods
+  
+  + across studies with a given method
+  
+* given an inference method, can one assemble a consensus network using as weights the number of times a given edge occurs? The frequency of occurrence?
+
+* how important is an edge (as measured by edge betweenness)? One must choose a meaningful context for this
+
+* are co-occurrence relationships more frequent among members of the same class or family (and the reverse for mutual exclusion)? This only makes sense within a given method and must be corrected by the frequency of ech given larger taxon.
+
+* given a (possibly important) microorganism, with which microorganisms is it most frequently associated with positive or negative associations? This only makes sense within a given method and once one has analyzed a large number of studies
+
+* for moderately large networks, which is the cumulative distribution of edge betweenness? Does this hold any importance in terms of structure of the networks?
+
+## Highly conserved edges, by method.  
+
+```{r edge_analysis_betweeness, dpi = 96, warning = F, message = F}
+if(keep_time) tic("Edge analysis")
+# load edge analysis df
+edge_list_df_fns <- file.path(data_path, all_files[str_detect(all_files, "edgelist")])
+edge_list_df <- map(edge_list_df_fns, read_tsv) |>
+  list_rbind(names_to = "iteration")
+# there is a problem with edge names
+edge_list_df <- edge_list_df |>
+  mutate(from_name = if_else(
+    str_detect(from_name, " "), str_split(from_name, pattern = " ", simplify = T)[1], from_name)
+  )
+
+# this calculates the empirical quantile of edge betweenness
+# by dataset and method: I suppose one can then select those >0.95
+# to get a sort of hubness for edges, but it makes sense only for 
+# large number of edges
+# need to rename the edges after genus
+
+edge_list_df_method <- edge_list_df %>% group_by(dataset, method) %>%
+  mutate(ebq = ecdf(edge_betw)(edge_betw)) %>% ungroup()
+
+# calculate the frequency of edges, by study and type and 
+# median value and IQR for IQR
+# this only checks for conserved edges across methods
+edge_freq_bystudy <- edge_list_df_method %>% 
+  group_by(dataset, asso_type, edge_name) %>% 
+  summarise(n = n(),
+            med_ebq = median(ebq),
+            iqr_ebq = IQR(ebq)) %>%
+  arrange(-n, -med_ebq, ) %>% 
+  ungroup()
+
+# I am now generating a plot may be with the top 50 edges
+edge_freq_bystudy <- edge_freq_bystudy %>%
+  arrange(-n, -med_ebq)
+
+# let's try a plot (gives an emphasis to most stable edges)
+slice_to_plot <- slice(edge_freq_bystudy, 1:50) %>%
+    mutate(edge_name = forcats::fct_reorder(edge_name, med_ebq)) 
+
+ggplot(slice_to_plot, 
+       mapping = aes(x = edge_name, y = med_ebq, size = n, color = asso_type)) +
+  geom_point() + 
+  coord_flip() +
+  labs(x = "edge", y = "edge betweenness quantile",
+      size = "edge freq.") +
+    scale_colour_manual(values = c("green","red"))
+
+
+# another way to see it, based on stability
+slice_to_plot_2 <- slice(edge_freq_bystudy, 1:50) %>%
+    mutate(edge_name = forcats::fct_reorder(edge_name, n))
+
+ggplot(slice_to_plot_2, 
+       mapping = aes(x = edge_name, y = n, size = med_ebq, color = asso_type)) +
+  geom_point() + 
+  coord_flip() +
+  labs(x = "edge", y = "edge freq.",
+      size = str_wrap("edge betweenness quantile", 15)) +
+    scale_colour_manual(values = c("green","red"))
+
+fn <- paste(file.path(output_folder,out_filename_pref), "_edge_n.tiff",sep="")
+ggsave(filename = fn, dpi = 600, width = 10, height = 7)
+```
+
+The analysis here was carried out by grouping by dataset and association type, therefore the frequency is within dataset and a frequency of 3 indicates that a given edge was detected by all 3 methods in a single dataset. A high edge betweenness indicates an edge that, if removed, disconnects the network in a larger number of components.
+
+It would be interesting to see which edges which connect nodes of which at least one is a yeast are important.
+
+```{r edge_methods_yeast, dpi = 96}
+edge_df_yeast <- edge_list_df |>
+  mutate(is_yeast_from = from_name %in% yeast_genera$`Species name`,
+         is_yeast_to = to_name %in% yeast_genera$`Species name`) |>
+  mutate(edges_with_Y_node = (is_yeast_from | is_yeast_to)) |>
+  dplyr::filter(edges_with_Y_node)
+
+edge_list_df_method_y <- edge_df_yeast  %>% 
+  group_by(dataset, method) %>%
+  mutate(ebq = ecdf(edge_betw)(edge_betw)) %>% 
+  ungroup()
+edge_freq_bystudy_y <-  edge_list_df_method_y %>% group_by(dataset, asso_type, edge_name) %>% 
+  summarise(n = n(),
+            med_ebq = median(ebq),
+            iqr_ebq = IQR(ebq)) %>%
+  arrange(-n, -med_ebq, ) %>% 
+  ungroup()
+
+# I am now generating a plot may be with the top 50 edges
+edge_freq_bystudy_y <- edge_freq_bystudy_y %>%
+  arrange(-n, -med_ebq)
+
+# let's try a plot (gives an emphasis to most stable edges)
+slice_to_plot_y <- slice(edge_freq_bystudy_y, 1:50) %>%
+    mutate(edge_name = forcats::fct_reorder(edge_name, med_ebq)) 
+
+ggplot(slice_to_plot_y, 
+       mapping = aes(x = edge_name, y = med_ebq, size = n, color = asso_type)) +
+  geom_point() + 
+  coord_flip() +
+  labs(x = "edge", y = "edge betweenness quantile",
+      size = "edge freq.") +
+    scale_colour_manual(values = c("green","red"))
+
+
+# another way to see it, based on stability
+slice_to_plot_2_y <- slice(edge_freq_bystudy_y, 1:50) %>%
+    mutate(edge_name = forcats::fct_reorder(edge_name, n))
+
+ggplot(slice_to_plot_2_y, 
+       mapping = aes(x = edge_name, y = n, size = med_ebq, color = asso_type)) +
+  geom_point() + 
+  coord_flip() +
+  labs(x = "edge", y = "edge freq.",
+      size = str_wrap("edge betweenness quantile", 15)) +
+    scale_colour_manual(values = c("green","red"))
+
+fn <- paste(file.path(output_folder,out_filename_pref), "y_edge_n.tiff",sep="")
+ggsave(filename = fn, dpi = 600, width = 10, height = 7)
+
+
+```
+The top 50 edges are always detected by at least two methods in at least one study
+
+##Edges which are conserved across different studies and methods.  
+
+The code can be easily modified to detect edges which are conserved across different studies and different methods. Here I am showing the results for spieceasi.  
+
+```{r edge_analysis_betw_acr_studies, dpi = 96, warning = F, message = F}
+if(keep_time) tic("Edge analysis, spieceasi")
+
+edge_list_df_study <- edge_list_df %>% 
+  group_by(dataset, method) %>%
+  mutate(ebq = ecdf(edge_betw)(edge_betw)) %>% ungroup()
+
+# calculate the frequency of edges, by method and type and 
+# median value and IQR for IQR
+# this only checks for conserved edges across methods
+
+edge_freq_by_study <- edge_list_df_study %>% 
+  group_by(method, asso_type, edge_name) %>% 
+  summarise(n = n(),
+            med_ebq = median(ebq),
+            iqr_ebq = IQR(ebq)) %>%
+  arrange(-n, -med_ebq, ) %>% 
+  ungroup()
+
+# I am now generating a plot may be with the top 50 edges, first for spieceasi
+edge_freq_by_study_se <- edge_freq_by_study %>%
+  dplyr::filter(method=="spieceasi") %>%
+  arrange(-n, -med_ebq)
+
+# let's try a plot (gives an emphasis to most stable edges)
+slice_to_plot_se <- edge_freq_by_study_se %>% 
+    dplyr::filter(n>=2) %>%
+    mutate(edge_name = forcats::fct_reorder(edge_name, med_ebq)) 
+
+ggplot(slice_to_plot_se, 
+       mapping = aes(x = edge_name, y = med_ebq, size = n, color = asso_type)) +
+  geom_point() + 
+  coord_flip() +
+  labs(x = "edge", y = "edge betweenness quantile",
+      size = "edge freq.") +
+    scale_colour_manual(values = c("green","red"))
+
+
+# another way to see it, based on stability
+slice_to_plot_2 <- slice(edge_freq_by_study_se, 1:50) %>%
+    mutate(edge_name = forcats::fct_reorder(edge_name, n))
+
+ggplot(slice_to_plot_2, 
+       mapping = aes(x = edge_name, y = n, size = med_ebq, color = asso_type)) +
+  geom_point() + 
+  coord_flip() +
+  labs(x = "edge", y = "edge freq.",
+      size = str_wrap("edge betweenness quantile", 15)) +
+    scale_colour_manual(values = c("green","red"))
+
+fn <- paste(file.path(output_folder,out_filename_pref), "_edge_n_method.tiff",sep="")
+ggsave(filename = fn, dpi = 600, width = 10, height = 7)
+```
+Only very few relationships are stable across studies.
+
+Again, the same graph can be reproduced by filtering by edges containing only yeasts.  
+
+```{r edge_analysis_betw_acr_studies_y, dpi = 96, warning = F, message = F}
+if(keep_time) tic("Edge analysis, spieceasi")
+
+edge_list_df_study_y <- edge_list_df_study |>
+  mutate(is_yeast_from = from_name %in% yeast_genera$`Species name`,
+         is_yeast_to = to_name %in% yeast_genera$`Species name`) |>
+  mutate(edges_with_Y_node = (is_yeast_from | is_yeast_to)) |>
+  dplyr::filter(edges_with_Y_node)
+  
+
+# calculate the frequency of edges, by method and type and 
+# median value and IQR for IQR
+# this only checks for conserved edges across methods
+
+edge_freq_by_study_y <- edge_list_df_study_y %>% 
+  group_by(method, asso_type, edge_name) %>% 
+  summarise(n = n(),
+            med_ebq = median(ebq),
+            iqr_ebq = IQR(ebq)) %>%
+  arrange(-n, -med_ebq, ) %>% 
+  ungroup()
+
+# I am now generating a plot may be with the top 50 edges, first for spieceasi
+edge_freq_by_study_y_se <- edge_freq_by_study_y %>%
+  dplyr::filter(method=="spieceasi") %>%
+  arrange(-n, -med_ebq)
+
+# let's try a plot (gives an emphasis to most stable edges)
+slice_to_plot_se_y <- edge_freq_by_study_y_se %>% 
+    dplyr::filter(n>=2) %>%
+    mutate(edge_name = forcats::fct_reorder(edge_name, med_ebq)) 
+
+ggplot(slice_to_plot_se_y, 
+       mapping = aes(x = edge_name, y = med_ebq, size = n, color = asso_type)) +
+  geom_point() + 
+  coord_flip() +
+  labs(x = "edge", y = "edge betweenness quantile",
+      size = "edge freq.") +
+    scale_colour_manual(values = c("green","red"))
+
+
+# another way to see it, based on stability
+slice_to_plot_2_y <- slice(edge_freq_by_study_y_se, 1:50) %>%
+    mutate(edge_name = forcats::fct_reorder(edge_name, n))
+
+ggplot(slice_to_plot_2_y, 
+       mapping = aes(x = edge_name, y = n, size = med_ebq, color = asso_type)) +
+  geom_point() + 
+  coord_flip() +
+  labs(x = "edge", y = "edge freq. (studies)",
+      size = str_wrap("edge betweenness quantile", 15)) +
+    scale_colour_manual(values = c("green","red"))
+
+fn <- paste(file.path(output_folder,out_filename_pref), "_edge_n_study_y.tiff",sep="")
+ggsave(filename = fn, dpi = 600, width = 10, height = 7)
+
+
+```
+
+
+# Stage 4. A network of networks.  
+
+Technically, one could reassemble a network based on edge stability, by method. This could give an idea of what happens across different studies.  
+As a test run I will only do this with SPIEC-EASI, for yeasts
+
+```{r network_of_networks_y}
+# I need to build the network from the edge table and add metadata information for nodes. 
+yeast_edge_df <- edge_freq_by_study_y_se |> 
+  select(edge_name, asso_type, weight = n) |>
+  separate_wider_delim(edge_name, names = c("from", "to"), cols_remove = F, delim = "--") |>
+  select(from, to, weight, asso_type, edge_name)
+yeast_nodes <- base::union(yeast_edge_df$from, yeast_edge_df$to)
+node_metadata_y <- node_stats_df |>
+  select(name = label, domain:order) |>
+  distinct()
+yeast_nodes_df <- tibble(name = yeast_nodes) |>
+  left_join(node_metadata_y) |>
+  mutate(is_yeast = name %in% yeast_genera$`Species name`)
+
+net_of_net_y <- tbl_graph(nodes = yeast_nodes_df, edges = yeast_edge_df, directed = F)
+# calculate stats
+net_of_net_y_wstats <- net_of_net_y %>%
+  activate(nodes) %>%
+  mutate(degree = centrality_degree(weights = weight),
+         eigen_cent = centrality_eigen(weights = weight),
+         close_cent = centrality_closeness(weights = weight)) 
+
+# because of one multiedge (nodes with both copres and mut_ex edge cannot cluster)
+net_of_net_y_copres <- net_of_net_y_wstats %>%
+  activate(edges) %>%
+  dplyr::filter(asso_type == "copres") %>%
+  activate(nodes)  %>%
+  mutate(degree = centrality_degree(weights = weight),
+         eigen_cent = centrality_eigen(weights = weight),
+         close_cent = centrality_closeness(weights = weight)) %>%
+  dplyr::filter(degree >0) %>%
+  mutate(clus_all = group_fast_greedy(weights = weight))
+# let's try with ggraph
+ggraph(net_of_net_y_copres)+
+  geom_edge_link(aes(edge_width = weight), edge_colour = I("cyan"), edge_alpha = I(0.5)) + 
+  geom_node_point(aes(colour = factor(clus_all), size = degree), alpha = I(0.8)) +
+  geom_node_text(mapping = aes(label = str_trunc(name, 8, side = "center", ellipsis = "_")), alpha = I(0.2)) +
+  scale_colour_brewer(type = "qual", palette = "Paired") +
+  theme_graph()
+
+```
+Adding names is a bit too much and there are still too many nodes. Possible solutions are:
+
+* use only nodes which are yeasts
+
+* showing only nodes with a centrality higher than a set value.  
+
+Incidentally, may be it is nice to see the hubs here.  
+
+```{r yeast_mold_hubs}
+net_of_net_y_copres |>
+  activate(nodes) |>
+  as_tibble() |>
+  arrange(desc(degree)) |>
+  select(name, class, is_yeast, degree, eigen_cent, close_cent, clus_all) |>
+  kable(caption = "A network of networks, table olives, SPIEC-EASI, copresence only") |>
+  kable_classic()
+```
+
+Many yeast genera which are known to be important in olive fermentation do not score high in this table. Several of them are found in cluster 8. It would be interesting to explore if the cluster reflect different niches.  
+
+# Acknowledgements, license, citation, etc. 
+
+## Acknowledgements
+
+This work was was carried out within the PRIN 2022 Project METAOlive 2022NN28ZZ and received funding from the European Union Next-GenerationEU, CUP C53D23005460006 (PIANO NAZIONALE DI RIPRESA E RESILIENZA (PNRR) – MISSIONE 4 COMPONENTE 2,  INVESTIMENTO 1.4 – D.D. 1048 14/07/2023). This script and its contents reflects only the authors’ views and opinions,  neither the European Union nor the European Commission can be considered  responsible for them. The script was developed, in part, within the PRIN 2022 PNRR Project NCY diversity P20229JMMH and received funding from the European Union Next-GenerationEU,CUP C53D23007560001 (PIANO NAZIONALE DI RIPRESA E RESILIENZA (PNRR) – MISSIONE 4 COMPONENTE 2,  INVESTIMENTO 1.4 – D.D. 1048 14/07/2023).  This script and its contents reflects only the authors’ views and opinions, neither the European Union nor the European Commission can be considered responsible for them.
+
+## Citations for R packages used in this document.  
+
+```{r r_packages, echo=F, include = T}
+all_packages <- c("base", .cran_packages, .bioc_packages)
+print(map(all_packages, citation, auto = T), bibtex = F)
+
+```
+
+## Session report 
+
+This script has been tested with R 4.4 and R4.3.3, x86 build, on a MacBook Pro 14 inch, 2023, with chip Apple M3 and 16 GB RAM and on a MacStudio 2023 with Apple M2 Max chip, both running MacOs Sonoma 14.7
+
+
+```{r not_run, eval = F}
+sessionInfo()
+```
+
+## License.  
+
+MIT License
+
+Copyright (c) 2024 EugenioP
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+  
+* The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

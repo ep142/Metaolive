@@ -16,7 +16,11 @@ on olive fermentations extracted from [FoodMicrobionet v5](https://github.com/ep
   + skan_it_growth_curve_v0_4_1.Rmd is a Rmarkdown file designed to process in 
   batch kinetics files generated with the [SkanIt](https://www.thermofisher.com/it/en/home/life-science/lab-equipment/microplate-instruments/plate-readers/software.html) software, fit a number of growth 
   curve models and select the best one in terms of AIC. The current version also fits a secondary model. An example growth curve 
-  file is provided. I am pretty sure it can be adapted to other plate readers.
+  file is provided. I am pretty sure it can be adapted to other plate readers.  
+  
+  + FMBN_metaolive_stats R markdown documents contain the code for descriptive statistical analysis on OliveFMBN  
+  
+  + METAOlive_MAN_ite_1_F_genus_v2_3.R and METAOlive_postprocess_f_genus.Rmd, together with the Source folder containing accessory scripts are examples of the pipeline used for inference and analysis of Microbial Association Networks  
 
 Data for bacteria have been used in a poster presented at the 
 [Food Systems Microbiomes](https://foodsystemsmicrobiomes.org) conference,
